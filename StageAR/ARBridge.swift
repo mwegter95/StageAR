@@ -40,15 +40,21 @@ final class ARBridge: NSObject {
         send("{ error: '\(safe)' }")
     }
 
-    /// Send a camera-frame snapshot to JS during scanning so the Three.js viewer
-    /// can render it as a textured photo plane anchored in 3D space.
-    func sendSnapshot(_ jpegData: Data, transform: [Float]) {
-        let b64 = jpegData.base64EncodedString()
-        let tfStr = transform.map { String(format: "%.5f", $0) }.joined(separator: ",")
-        // Wrap in a setTimeout(0) to avoid blocking the WKWebView render thread
+    /// Send a camera-frame snapshot to JS so the web app can re-project each
+    /// LiDAR point through the best-covering photo and replace its low-res
+    /// depth-sensor colour with the true high-res photo colour.
+    ///
+    /// - Parameters:
+    ///   - jpegData:   JPEG bytes of the (already resized) camera frame
+    ///   - transform:  column-major 4×4 camera→world matrix (16 floats)
+    ///   - intrinsics: [fx, fy, cx, cy, imageWidth, imageHeight] scaled to the JPEG
+    func sendSnapshot(_ jpegData: Data, transform: [Float], intrinsics: [Float]) {
+        let b64   = jpegData.base64EncodedString()
+        let tfStr = transform.map   { String(format: "%.5f", $0) }.joined(separator: ",")
+        let inStr = intrinsics.map  { String(format: "%.2f", $0) }.joined(separator: ",")
         DispatchQueue.main.async { [weak self] in
             self?.webView?.evaluateJavaScript(
-                "window.onStageARResult && window.onStageARResult({ status:'snapshot', dataUrl:'data:image/jpeg;base64,\(b64)', transform:[\(tfStr)] })",
+                "window.onStageARResult && window.onStageARResult({ status:'snapshot', dataUrl:'data:image/jpeg;base64,\(b64)', transform:[\(tfStr)], intrinsics:[\(inStr)] })",
                 completionHandler: nil
             )
         }

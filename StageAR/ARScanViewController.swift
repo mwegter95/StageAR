@@ -44,6 +44,16 @@ class ARScanViewController: UIViewController {
     private let BATCH_FLUSH   = 10   // flush to SceneKit every N sampled frames (fewer, larger batches)
     private var sampledFrames = 0
 
+    // MARK: - Photo snapshot state
+    // Every SNAPSHOT_EVERY *sampled* frames we capture a high-res JPEG + camera
+    // pose so the web app can re-texture the point cloud with true photo colour.
+    private let SNAPSHOT_EVERY = 90    // ~3 s between snapshots at 30 captured fps
+    private let MAX_SNAPSHOTS  = 30    // cap so we don't overwhelm the bridge
+    private var snapshotFrameCount = 0
+    private var snapshotCount      = 0
+    private var isCapturing        = false   // debounce — one JPEG at a time
+    private lazy var ciContext     = CIContext()
+
     // Archimedean spiral scan pattern — precomputed pixel coordinates from center outward.
     // Each sampled frame processes BATCH_PER_FRAME consecutive spiral steps, creating a
     // "record groove" scanning visual in the live SceneKit view as the cloud builds up.
@@ -327,8 +337,60 @@ class ARScanViewController: UIViewController {
         return (r, g, b)
     }
 
-    // MARK: - Snapshot (disabled — photo overlay parked, dense splat point cloud used instead)
-    // private func captureSnapshot(_ frame: ARFrame) { ... }
+    // MARK: - Snapshot capture
+    // Captures a 960-px-wide JPEG of the current camera frame along with the
+    // camera's world transform and intrinsics.  The web app uses these to
+    // re-project each LiDAR point through the best-covering snapshot and replace
+    // its low-res depth-sensor colour with the true high-res photo colour.
+    private func captureSnapshot(_ frame: ARFrame) {
+        guard !isCapturing else { return }
+        isCapturing = true
+
+        let pixBuf = frame.capturedImage
+        let origW  = CVPixelBufferGetWidth(pixBuf)
+        let origH  = CVPixelBufferGetHeight(pixBuf)
+
+        // Scale to 960 wide — keeps JPEG under ~60 KB while preserving enough
+        // detail for accurate colour sampling at normal room distances.
+        let targetW: CGFloat = 960
+        let scale            = targetW / CGFloat(origW)
+        let targetH          = CGFloat(origH) * scale
+
+        let ci     = CIImage(cvPixelBuffer: pixBuf)
+        let scaled = ci.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+
+        guard let cgImg    = ciContext.createCGImage(scaled, from: scaled.extent),
+              let jpegData = UIImage(cgImage: cgImg).jpegData(compressionQuality: 0.72)
+        else { isCapturing = false; return }
+
+        // Camera world transform — column-major 16 floats
+        // ARKit: camera looks along -Z; Y is up; transform = camera→world matrix.
+        let c = frame.camera.transform
+        let transform: [Float] = [
+            c.columns.0.x, c.columns.0.y, c.columns.0.z, c.columns.0.w,
+            c.columns.1.x, c.columns.1.y, c.columns.1.z, c.columns.1.w,
+            c.columns.2.x, c.columns.2.y, c.columns.2.z, c.columns.2.w,
+            c.columns.3.x, c.columns.3.y, c.columns.3.z, c.columns.3.w,
+        ]
+
+        // Intrinsics scaled to the output JPEG resolution.
+        // frame.camera.intrinsics is column-major simd_float3x3:
+        //   col0 = (fx, 0, 0), col1 = (0, fy, 0), col2 = (cx, cy, 1)
+        let intr = frame.camera.intrinsics
+        let sx   = Float(scale)
+        let sy   = Float(scale)
+        let intrinsics: [Float] = [
+            intr[0][0] * sx,  // fx
+            intr[1][1] * sy,  // fy
+            intr[2][0] * sx,  // cx
+            intr[2][1] * sy,  // cy
+            Float(targetW),   // imageWidth
+            Float(targetH),   // imageHeight
+        ]
+
+        ARBridge.shared.sendSnapshot(jpegData, transform: transform, intrinsics: intrinsics)
+        isCapturing = false
+    }
 
     // MARK: - SceneKit geometry
 
@@ -458,13 +520,13 @@ extension ARScanViewController: ARSessionDelegate {
             flushBatchToScene()
         }
 
-        // Photo overlay disabled — snapshot capture suspended
-        // snapshotSampledCount += 1
-        // if snapshotSampledCount >= SNAPSHOT_EVERY && snapshotCount < MAX_SNAPSHOTS {
-        //     snapshotSampledCount = 0
-        //     snapshotCount += 1
-        //     captureSnapshot(frame)
-        // }
+        // Photo snapshot — every SNAPSHOT_EVERY sampled frames, up to MAX_SNAPSHOTS
+        snapshotFrameCount += 1
+        if snapshotFrameCount >= SNAPSHOT_EVERY && snapshotCount < MAX_SNAPSHOTS {
+            snapshotFrameCount = 0
+            snapshotCount += 1
+            captureSnapshot(frame)
+        }
     }
 
     func session(_ session: ARSession, didFailWithError error: Error) {
