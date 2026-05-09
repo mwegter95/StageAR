@@ -47,12 +47,16 @@ class ARScanViewController: UIViewController {
     // MARK: - Photo snapshot state
     // Every SNAPSHOT_EVERY *sampled* frames we capture a high-res JPEG + camera
     // pose so the web app can re-texture the point cloud with true photo colour.
-    private let SNAPSHOT_EVERY = 90    // ~3 s between snapshots at 30 captured fps
-    private let MAX_SNAPSHOTS  = 30    // cap so we don't overwhelm the bridge
+    private let SNAPSHOT_EVERY = 120   // ~4 s between snapshots at 30 captured fps
+    private let MAX_SNAPSHOTS  = 18    // cap memory + bridge pressure on long scans
     private var snapshotFrameCount = 0
     private var snapshotCount      = 0
     private var isCapturing        = false   // debounce — one JPEG at a time
     private lazy var ciContext     = CIContext()
+    private var lastSnapshotPos: SIMD3<Float>? = nil
+    private var lastSnapshotFwd: SIMD3<Float>? = nil
+    private let SNAPSHOT_MIN_MOVE: Float = 0.25
+    private let SNAPSHOT_MIN_ROT_DOT: Float = 0.985
 
     // Archimedean spiral scan pattern — precomputed pixel coordinates from center outward.
     // Each sampled frame processes BATCH_PER_FRAME consecutive spiral steps, creating a
@@ -62,6 +66,7 @@ class ARScanViewController: UIViewController {
     private let BATCH_PER_FRAME = 2500   // spiral steps per frame; full 49152-px sweep in ~0.33 s at 60 fps
     private let MIN_DEPTH: Float  = 0.15
     private let MAX_DEPTH: Float  = 8.0  // indoor rooms rarely exceed 8 m
+    private var pointSampleCounter = 0
 
     // SceneKit child-node merge: every N flushes, collapse all children into one
     // geometry node so we never accumulate thousands of separate SCNNodes.
@@ -280,6 +285,22 @@ class ARScanViewController: UIViewController {
             guard d > MIN_DEPTH && d < MAX_DEPTH else { continue }
             if let cp = confPtr, cp[py * dW + px] < 1 { continue }
 
+            // Adaptive sampling for long scans: preserve visual quality while
+            // preventing unbounded growth that can crash older devices.
+            let projected = totalPointsSent + batchPos.count
+            let keepEvery: Int
+            if projected < 2_000_000 {
+                keepEvery = 1
+            } else if projected < 4_000_000 {
+                keepEvery = 2
+            } else if projected < 8_000_000 {
+                keepEvery = 3
+            } else {
+                keepEvery = 4
+            }
+            pointSampleCounter += 1
+            if keepEvery > 1 && (pointSampleCounter % keepEvery != 0) { continue }
+
             // Camera space → world space (ARKit: camera looks along -Z, Y is up)
             let xc =  (Float(px) - cx) / fx * d
             let yc = -(Float(py) - cy) / fy * d
@@ -350,9 +371,8 @@ class ARScanViewController: UIViewController {
         let origW  = CVPixelBufferGetWidth(pixBuf)
         let origH  = CVPixelBufferGetHeight(pixBuf)
 
-        // Scale to 960 wide — keeps JPEG under ~60 KB while preserving enough
-        // detail for accurate colour sampling at normal room distances.
-        let targetW: CGFloat = 960
+        // Scale to 640 wide for a safer memory profile on long scans.
+        let targetW: CGFloat = 640
         let scale            = targetW / CGFloat(origW)
         let targetH          = CGFloat(origH) * scale
 
@@ -360,7 +380,7 @@ class ARScanViewController: UIViewController {
         let scaled = ci.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
 
         guard let cgImg    = ciContext.createCGImage(scaled, from: scaled.extent),
-              let jpegData = UIImage(cgImage: cgImg).jpegData(compressionQuality: 0.72)
+              let jpegData = UIImage(cgImage: cgImg).jpegData(compressionQuality: 0.58)
         else { isCapturing = false; return }
 
         // Camera world transform — column-major 16 floats
@@ -389,7 +409,19 @@ class ARScanViewController: UIViewController {
         ]
 
         ARBridge.shared.sendSnapshot(jpegData, transform: transform, intrinsics: intrinsics)
+        lastSnapshotPos = SIMD3<Float>(c.columns.3.x, c.columns.3.y, c.columns.3.z)
+        lastSnapshotFwd = simd_normalize(SIMD3<Float>(-c.columns.2.x, -c.columns.2.y, -c.columns.2.z))
         isCapturing = false
+    }
+
+    private func shouldCaptureSnapshot(_ frame: ARFrame) -> Bool {
+        guard let lastPos = lastSnapshotPos, let lastFwd = lastSnapshotFwd else { return true }
+        let c = frame.camera.transform
+        let pos = SIMD3<Float>(c.columns.3.x, c.columns.3.y, c.columns.3.z)
+        let fwd = simd_normalize(SIMD3<Float>(-c.columns.2.x, -c.columns.2.y, -c.columns.2.z))
+        let moved = simd_length(pos - lastPos)
+        let dotv = simd_dot(fwd, lastFwd)
+        return moved >= SNAPSHOT_MIN_MOVE || dotv <= SNAPSHOT_MIN_ROT_DOT
     }
 
     // MARK: - SceneKit geometry
@@ -524,8 +556,10 @@ extension ARScanViewController: ARSessionDelegate {
         snapshotFrameCount += 1
         if snapshotFrameCount >= SNAPSHOT_EVERY && snapshotCount < MAX_SNAPSHOTS {
             snapshotFrameCount = 0
-            snapshotCount += 1
-            captureSnapshot(frame)
+            if shouldCaptureSnapshot(frame) {
+                snapshotCount += 1
+                captureSnapshot(frame)
+            }
         }
     }
 

@@ -54,7 +54,7 @@ final class ARBridge: NSObject {
         let inStr = intrinsics.map  { String(format: "%.2f", $0) }.joined(separator: ",")
         DispatchQueue.main.async { [weak self] in
             self?.webView?.evaluateJavaScript(
-                "window.onStageARResult && window.onStageARResult({ status:'snapshot', dataUrl:'data:image/jpeg;base64,\(b64)', transform:[\(tfStr)], intrinsics:[\(inStr)] })",
+                "window.onStageARResult && window.onStageARResult({ status:'snapshot', jpegB64:'\(b64)', transform:[\(tfStr)], intrinsics:[\(inStr)] })",
                 completionHandler: nil
             )
         }
