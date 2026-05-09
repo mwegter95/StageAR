@@ -48,7 +48,7 @@ class ARScanViewController: UIViewController {
     // Every SNAPSHOT_EVERY *sampled* frames we capture a high-res JPEG + camera
     // pose so the web app can re-texture the point cloud with true photo colour.
     private let SNAPSHOT_EVERY = 120   // ~4 s between snapshots at 30 captured fps
-    private let MAX_SNAPSHOTS  = 18    // cap memory + bridge pressure on long scans
+    private let MAX_SNAPSHOTS  = 75    // supports ~5 minute scans at the default snapshot cadence
     private var snapshotFrameCount = 0
     private var snapshotCount      = 0
     private var isCapturing        = false   // debounce — one JPEG at a time
@@ -75,6 +75,8 @@ class ARScanViewController: UIViewController {
 
     // Root node that holds all batch child nodes
     private var pointCloudNode: SCNNode!
+    private let PREVIEW_POINT_BUDGET = 250_000
+    private var previewPointsRendered = 0
 
     // MARK: - Lifecycle
 
@@ -424,6 +426,26 @@ class ARScanViewController: UIViewController {
         return moved >= SNAPSHOT_MIN_MOVE || dotv <= SNAPSHOT_MIN_ROT_DOT
     }
 
+    private func previewBatch(pos: [Float3], col: [Float3]) -> ([Float3], [Float3]) {
+        let remaining = PREVIEW_POINT_BUDGET - previewPointsRendered
+        guard remaining > 0 else { return ([], []) }
+        guard pos.count > remaining else { return (pos, col) }
+
+        let stride = max(1, Int(ceil(Double(pos.count) / Double(remaining))))
+        var previewPos = [Float3]()
+        var previewCol = [Float3]()
+        previewPos.reserveCapacity(remaining)
+        previewCol.reserveCapacity(remaining)
+
+        var index = 0
+        while index < pos.count && previewPos.count < remaining {
+            previewPos.append(pos[index])
+            previewCol.append(col[index])
+            index += stride
+        }
+        return (previewPos, previewCol)
+    }
+
     // MARK: - SceneKit geometry
 
     private func flushBatchToScene() {
@@ -450,22 +472,29 @@ class ARScanViewController: UIViewController {
 
             self.totalPointsSent += pos.count    // main-thread-only counter
 
-            let geo  = self.makePointGeo(pos: pos, col: col)
-            let node = SCNNode(geometry: geo)
-            self.pointCloudNode.addChildNode(node)
+            let (previewPos, previewCol) = self.previewBatch(pos: pos, col: col)
+            if !previewPos.isEmpty {
+                let geo  = self.makePointGeo(pos: previewPos, col: previewCol)
+                let node = SCNNode(geometry: geo)
+                self.pointCloudNode.addChildNode(node)
+                self.previewPointsRendered += previewPos.count
 
-            // Periodically merge all child nodes into a single geometry to prevent
-            // SceneKit from choking on hundreds of separate SCNNode objects.
-            if shouldMerge {
-                self.mergePointCloudNodes()
+                // Periodically merge all child nodes into a single geometry to prevent
+                // SceneKit from choking on hundreds of separate SCNNode objects.
+                if shouldMerge {
+                    self.mergePointCloudNodes()
+                }
             }
 
             let n = self.totalPointsSent
-            self.countLabel.text = n >= 1_000_000
+            let baseLabel = n >= 1_000_000
                 ? String(format: "%.2fM pts", Double(n) / 1_000_000.0)
                 : n >= 1000
                     ? String(format: "%.1fk pts", Double(n) / 1000.0)
                     : "\(n) pts"
+            self.countLabel.text = self.previewPointsRendered >= self.PREVIEW_POINT_BUDGET
+                ? "\(baseLabel) • preview capped"
+                : baseLabel
         }
     }
 
