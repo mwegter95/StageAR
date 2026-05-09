@@ -68,15 +68,11 @@ class ARScanViewController: UIViewController {
     private let MAX_DEPTH: Float  = 8.0  // indoor rooms rarely exceed 8 m
     private var pointSampleCounter = 0
 
-    // SceneKit child-node merge: every N flushes, collapse all children into one
-    // geometry node so we never accumulate thousands of separate SCNNodes.
-    private var flushCount   = 0
-    private let MERGE_EVERY  = 30
-
     // Root node that holds all batch child nodes
     private var pointCloudNode: SCNNode!
-    private let PREVIEW_POINT_BUDGET = 250_000
-    private var previewPointsRendered = 0
+    private let PREVIEW_BATCH_TARGET = 3_500
+    private let PREVIEW_NODE_LIMIT   = 55
+    private let PREVIEW_CELL_SIZE: Float = 0.055
 
     // MARK: - Lifecycle
 
@@ -203,6 +199,12 @@ class ARScanViewController: UIViewController {
 
     @objc private func doneTapped() {
         sceneView.session.pause()
+        // Release preview nodes before dismiss to avoid retaining large SceneKit buffers.
+        let children = pointCloudNode.childNodes
+        for node in children {
+            node.geometry = nil
+            node.removeFromParentNode()
+        }
         let total = totalPointsSent
         dismiss(animated: true) { [weak self] in
             self?.onComplete?([])           // data already streamed; pass empty array
@@ -427,22 +429,39 @@ class ARScanViewController: UIViewController {
     }
 
     private func previewBatch(pos: [Float3], col: [Float3]) -> ([Float3], [Float3]) {
-        let remaining = PREVIEW_POINT_BUDGET - previewPointsRendered
-        guard remaining > 0 else { return ([], []) }
-        guard pos.count > remaining else { return (pos, col) }
+        guard !pos.isEmpty else { return ([], []) }
+        if pos.count <= PREVIEW_BATCH_TARGET { return (pos, col) }
 
-        let stride = max(1, Int(ceil(Double(pos.count) / Double(remaining))))
+        var covered = Set<String>()
         var previewPos = [Float3]()
         var previewCol = [Float3]()
-        previewPos.reserveCapacity(remaining)
-        previewCol.reserveCapacity(remaining)
+        previewPos.reserveCapacity(PREVIEW_BATCH_TARGET)
+        previewCol.reserveCapacity(PREVIEW_BATCH_TARGET)
 
-        var index = 0
-        while index < pos.count && previewPos.count < remaining {
-            previewPos.append(pos[index])
-            previewCol.append(col[index])
-            index += stride
+        for index in 0..<pos.count {
+            let p = pos[index]
+            let ix = Int(floor(p.x / PREVIEW_CELL_SIZE))
+            let iy = Int(floor(p.y / PREVIEW_CELL_SIZE))
+            let iz = Int(floor(p.z / PREVIEW_CELL_SIZE))
+            let key = "\(ix):\(iy):\(iz)"
+            if covered.insert(key).inserted {
+                previewPos.append(p)
+                previewCol.append(col[index])
+                if previewPos.count >= PREVIEW_BATCH_TARGET { break }
+            }
         }
+
+        if previewPos.count < PREVIEW_BATCH_TARGET {
+            let needed = PREVIEW_BATCH_TARGET - previewPos.count
+            let stride = max(1, pos.count / max(1, needed))
+            var i = 0
+            while i < pos.count && previewPos.count < PREVIEW_BATCH_TARGET {
+                previewPos.append(pos[i])
+                previewCol.append(col[i])
+                i += stride
+            }
+        }
+
         return (previewPos, previewCol)
     }
 
@@ -463,10 +482,6 @@ class ARScanViewController: UIViewController {
         }
         ARBridge.shared.sendChunk(interleaved)   // dispatches to main internally
 
-        flushCount += 1
-        let shouldMerge = flushCount >= MERGE_EVERY
-        if shouldMerge { flushCount = 0 }
-
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
 
@@ -477,12 +492,12 @@ class ARScanViewController: UIViewController {
                 let geo  = self.makePointGeo(pos: previewPos, col: previewCol)
                 let node = SCNNode(geometry: geo)
                 self.pointCloudNode.addChildNode(node)
-                self.previewPointsRendered += previewPos.count
 
-                // Periodically merge all child nodes into a single geometry to prevent
-                // SceneKit from choking on hundreds of separate SCNNode objects.
-                if shouldMerge {
-                    self.mergePointCloudNodes()
+                // Keep a rolling bounded preview so dots continue updating for long scans.
+                while self.pointCloudNode.childNodes.count > self.PREVIEW_NODE_LIMIT {
+                    guard let oldest = self.pointCloudNode.childNodes.first else { break }
+                    oldest.geometry = nil
+                    oldest.removeFromParentNode()
                 }
             }
 
@@ -492,49 +507,17 @@ class ARScanViewController: UIViewController {
                 : n >= 1000
                     ? String(format: "%.1fk pts", Double(n) / 1000.0)
                     : "\(n) pts"
-            self.countLabel.text = self.previewPointsRendered >= self.PREVIEW_POINT_BUDGET
-                ? "\(baseLabel) • preview capped"
-                : baseLabel
+            self.countLabel.text = baseLabel
         }
     }
 
-    /// Collapse all SCNNode children of pointCloudNode into a single node.
-    /// This keeps the SceneKit scene graph flat even after hundreds of flush cycles.
-    private func mergePointCloudNodes() {
-        let children = pointCloudNode.childNodes
-        guard children.count > 1 else { return }
-
-        // Collect all position and colour data from every child geometry
-        var mergedPos = [Float3]()
-        var mergedCol = [Float3]()
-
-        for child in children {
-            guard let geo = child.geometry,
-                  let posSrc = geo.sources(for: .vertex).first,
-                  let colSrc = geo.sources(for: .color).first else { continue }
-
-            let n = posSrc.vectorCount
-            posSrc.data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-                let ptr = raw.baseAddress!.assumingMemoryBound(to: Float3.self)
-                mergedPos.append(contentsOf: UnsafeBufferPointer(start: ptr, count: n))
-            }
-            colSrc.data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-                let ptr = raw.baseAddress!.assumingMemoryBound(to: Float3.self)
-                mergedCol.append(contentsOf: UnsafeBufferPointer(start: ptr, count: n))
-            }
-        }
-
-        guard !mergedPos.isEmpty else { return }
-
-        // Remove all existing children
-        children.forEach { $0.removeFromParentNode() }
-
-        // Add a single merged node
-        let merged = SCNNode(geometry: makePointGeo(pos: mergedPos, col: mergedCol))
-        pointCloudNode.addChildNode(merged)
-    }
-
-    private func makePointGeo(pos: [Float3], col: [Float3]) -> SCNGeometry {
+    private func makePointGeo(
+        pos: [Float3],
+        col: [Float3],
+        pointSize: CGFloat = 8,
+        minimumPointScreenSpaceRadius: CGFloat = 2,
+        maximumPointScreenSpaceRadius: CGFloat = 12
+    ) -> SCNGeometry {
         let n = pos.count
         let posData = Data(bytes: pos, count: n * MemoryLayout<Float3>.stride)
         let colData = Data(bytes: col, count: n * MemoryLayout<Float3>.stride)
@@ -557,9 +540,9 @@ class ARScanViewController: UIViewController {
         let idxData = Data(bytes: &indices, count: n * 4)
         let element = SCNGeometryElement(data: idxData, primitiveType: .point,
                                          primitiveCount: n, bytesPerIndex: 4)
-        element.pointSize                   = 8
-        element.minimumPointScreenSpaceRadius = 2
-        element.maximumPointScreenSpaceRadius = 12
+        element.pointSize                   = pointSize
+        element.minimumPointScreenSpaceRadius = minimumPointScreenSpaceRadius
+        element.maximumPointScreenSpaceRadius = maximumPointScreenSpaceRadius
 
         return SCNGeometry(sources: [posSrc, colSrc], elements: [element])
     }
