@@ -57,6 +57,11 @@ class ARScanViewController: UIViewController {
     private var lastSnapshotFwd: SIMD3<Float>? = nil
     private let SNAPSHOT_MIN_MOVE: Float = 0.25
     private let SNAPSHOT_MIN_ROT_DOT: Float = 0.985
+    private var lastFramePos: SIMD3<Float>? = nil
+    private var lastFrameFwd: SIMD3<Float>? = nil
+    private var lastFrameTs: TimeInterval? = nil
+    private let SNAPSHOT_MAX_LINEAR_SPEED: Float = 0.42     // m/s
+    private let SNAPSHOT_MAX_ANGULAR_SPEED: Float = 1.6     // rad/s
 
     // Archimedean spiral scan pattern — precomputed pixel coordinates from center outward.
     // Each sampled frame processes BATCH_PER_FRAME consecutive spiral steps, creating a
@@ -419,10 +424,29 @@ class ARScanViewController: UIViewController {
     }
 
     private func shouldCaptureSnapshot(_ frame: ARFrame) -> Bool {
-        guard let lastPos = lastSnapshotPos, let lastFwd = lastSnapshotFwd else { return true }
+        // Require robust tracking to avoid smear from unstable pose estimates.
+        switch frame.camera.trackingState {
+        case .normal:
+            break
+        default:
+            return false
+        }
+
         let c = frame.camera.transform
         let pos = SIMD3<Float>(c.columns.3.x, c.columns.3.y, c.columns.3.z)
         let fwd = simd_normalize(SIMD3<Float>(-c.columns.2.x, -c.columns.2.y, -c.columns.2.z))
+
+        if let lp = lastFramePos, let lf = lastFrameFwd, let ts = lastFrameTs {
+            let dt = max(1e-3, Float(frame.timestamp - ts))
+            let linearSpeed = simd_length(pos - lp) / dt
+            let dotv = max(-1.0, min(1.0, simd_dot(fwd, lf)))
+            let angularSpeed = acos(dotv) / dt
+            if linearSpeed > SNAPSHOT_MAX_LINEAR_SPEED || angularSpeed > SNAPSHOT_MAX_ANGULAR_SPEED {
+                return false
+            }
+        }
+
+        guard let lastPos = lastSnapshotPos, let lastFwd = lastSnapshotFwd else { return true }
         let moved = simd_length(pos - lastPos)
         let dotv = simd_dot(fwd, lastFwd)
         return moved >= SNAPSHOT_MIN_MOVE || dotv <= SNAPSHOT_MIN_ROT_DOT
@@ -553,6 +577,10 @@ class ARScanViewController: UIViewController {
 extension ARScanViewController: ARSessionDelegate {
 
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
+        let c = frame.camera.transform
+        let curPos = SIMD3<Float>(c.columns.3.x, c.columns.3.y, c.columns.3.z)
+        let curFwd = simd_normalize(SIMD3<Float>(-c.columns.2.x, -c.columns.2.y, -c.columns.2.z))
+
         frameIndex += 1
         guard frameIndex % SAMPLE_EVERY == 0 else { return }
 
@@ -573,6 +601,10 @@ extension ARScanViewController: ARSessionDelegate {
                 captureSnapshot(frame)
             }
         }
+
+        lastFramePos = curPos
+        lastFrameFwd = curFwd
+        lastFrameTs = frame.timestamp
     }
 
     func session(_ session: ARSession, didFailWithError error: Error) {
