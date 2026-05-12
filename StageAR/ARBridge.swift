@@ -40,26 +40,6 @@ final class ARBridge: NSObject {
         send("{ error: '\(safe)' }")
     }
 
-    /// Send a camera-frame snapshot to JS so the web app can re-project each
-    /// LiDAR point through the best-covering photo and replace its low-res
-    /// depth-sensor colour with the true high-res photo colour.
-    ///
-    /// - Parameters:
-    ///   - jpegData:   JPEG bytes of the (already resized) camera frame
-    ///   - transform:  column-major 4×4 camera→world matrix (16 floats)
-    ///   - intrinsics: [fx, fy, cx, cy, imageWidth, imageHeight] scaled to the JPEG
-    func sendSnapshot(_ jpegData: Data, transform: [Float], intrinsics: [Float]) {
-        let b64   = jpegData.base64EncodedString()
-        let tfStr = transform.map   { String(format: "%.5f", $0) }.joined(separator: ",")
-        let inStr = intrinsics.map  { String(format: "%.2f", $0) }.joined(separator: ",")
-        DispatchQueue.main.async { [weak self] in
-            self?.webView?.evaluateJavaScript(
-                "window.onStageARResult && window.onStageARResult({ status:'snapshot', jpegB64:'\(b64)', transform:[\(tfStr)], intrinsics:[\(inStr)] })",
-                completionHandler: nil
-            )
-        }
-    }
-
     // MARK: - Scan
 
     private func startScan() {
@@ -99,7 +79,21 @@ final class ARBridge: NSObject {
         send("{ status: 'chunk', count: \(count), data: '\(b64)' }")
     }
 
+    /// Stream one RGB snapshot immediately so web can upload incrementally.
+    func sendSnapshot(index: Int,
+                      jpeg: Data,
+                      c2w: [Float],
+                      K: [Float],
+                      fw: Int,
+                      fh: Int) {
+        let b64    = jpeg.base64EncodedString()
+        let c2wStr = c2w.map { String($0) }.joined(separator: ",")
+        let kStr   = K.map   { String($0) }.joined(separator: ",")
+        send("{ status: 'snapshot', index: \(index), snapshot: { jpeg:'\(b64)', c2w:[\(c2wStr)], K:[\(kStr)], fw:\(fw), fh:\(fh) } }")
+    }
+
     /// Called once when the user taps Done. JS already has all points via chunk events.
+    /// Snapshot images are sent earlier via `sendSnapshot` to avoid a huge final payload.
     func sendDone(pointCount: Int) {
         let ms = Int(Date().timeIntervalSince1970 * 1000)
         send("{ status: 'done', pointCount: \(pointCount), capturedAt: \(ms) }")

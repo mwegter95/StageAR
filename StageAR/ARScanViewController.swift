@@ -43,41 +43,36 @@ class ARScanViewController: UIViewController {
     private let SAMPLE_EVERY  = 1    // process depth every ARKit frame (60 fps → ~0.33 s full sweep)
     private let BATCH_FLUSH   = 10   // flush to SceneKit every N sampled frames (fewer, larger batches)
     private var sampledFrames = 0
-
-    // MARK: - Photo snapshot state
-    // Every SNAPSHOT_EVERY *sampled* frames we capture a high-res JPEG + camera
-    // pose so the web app can re-texture the point cloud with true photo colour.
-    private let SNAPSHOT_EVERY = 120   // ~4 s between snapshots at 30 captured fps
-    private let MAX_SNAPSHOTS  = 75    // supports ~5 minute scans at the default snapshot cadence
-    private var snapshotFrameCount = 0
-    private var snapshotCount      = 0
-    private var isCapturing        = false   // debounce — one JPEG at a time
-    private lazy var ciContext     = CIContext()
-    private var lastSnapshotPos: SIMD3<Float>? = nil
-    private var lastSnapshotFwd: SIMD3<Float>? = nil
-    private let SNAPSHOT_MIN_MOVE: Float = 0.25
-    private let SNAPSHOT_MIN_ROT_DOT: Float = 0.985
+    private let CAPTURE_MAX_LINEAR_SPEED: Float = 1.05   // m/s; skip very unstable camera motion
+    private let CAPTURE_MAX_ANGULAR_SPEED: Float = 3.4   // rad/s
     private var lastFramePos: SIMD3<Float>? = nil
     private var lastFrameFwd: SIMD3<Float>? = nil
     private var lastFrameTs: TimeInterval? = nil
-    private let SNAPSHOT_MAX_LINEAR_SPEED: Float = 0.42     // m/s
-    private let SNAPSHOT_MAX_ANGULAR_SPEED: Float = 1.6     // rad/s
 
     // Archimedean spiral scan pattern — precomputed pixel coordinates from center outward.
     // Each sampled frame processes BATCH_PER_FRAME consecutive spiral steps, creating a
     // "record groove" scanning visual in the live SceneKit view as the cloud builds up.
     private var spiralCoords  = [(Int32, Int32)]()
     private var spiralPhase   = 0
-    private let BATCH_PER_FRAME = 2500   // spiral steps per frame; full 49152-px sweep in ~0.33 s at 60 fps
+    private let BATCH_PER_FRAME_STABLE = 5200 // stable motion: denser cloud faster
+    private let BATCH_PER_FRAME_MOVING = 3200 // moderate motion: balance density and stability
+    private let BATCH_PER_FRAME_FAST   = 1800 // rapid motion: prioritize stability
     private let MIN_DEPTH: Float  = 0.15
     private let MAX_DEPTH: Float  = 8.0  // indoor rooms rarely exceed 8 m
     private var pointSampleCounter = 0
 
+    private var lastSnapshotPos: SIMD3<Float>? = nil
+    private var snapshotFrameCounter = 0
+    private var snapshotIndex = 0
+    private let SNAPSHOT_INTERVAL_FRAMES = 45  // ~0.75 s at 60 fps; enough to move
+    private let SNAPSHOT_MIN_MOVE: Float   = 0.20 // 20 cm minimum between snapshots
+    private let SNAPSHOT_MAX_COUNT         = 15
+
     // Root node that holds all batch child nodes
     private var pointCloudNode: SCNNode!
-    private let PREVIEW_BATCH_TARGET = 3_500
+    private let PREVIEW_BATCH_TARGET = 5_000
     private let PREVIEW_NODE_LIMIT   = 55
-    private let PREVIEW_CELL_SIZE: Float = 0.055
+    private let PREVIEW_CELL_SIZE: Float = 0.045
 
     // MARK: - Lifecycle
 
@@ -212,7 +207,7 @@ class ARScanViewController: UIViewController {
         }
         let total = totalPointsSent
         dismiss(animated: true) { [weak self] in
-            self?.onComplete?([])           // data already streamed; pass empty array
+            self?.onComplete?([])              // point data already streamed via chunks
             ARBridge.shared.sendDone(pointCount: total)
         }
     }
@@ -245,7 +240,13 @@ class ARScanViewController: UIViewController {
         }
     }
 
-    private func processFrame(_ frame: ARFrame) {
+    private func samplesForMotion(linearSpeed: Float, angularSpeed: Float) -> Int {
+        if linearSpeed > 0.8 || angularSpeed > 2.4 { return BATCH_PER_FRAME_FAST }
+        if linearSpeed > 0.42 || angularSpeed > 1.45 { return BATCH_PER_FRAME_MOVING }
+        return BATCH_PER_FRAME_STABLE
+    }
+
+    private func processFrame(_ frame: ARFrame, samplesPerFrame: Int) {
         guard let depthData = frame.smoothedSceneDepth ?? frame.sceneDepth else { return }
 
         let depthMap = depthData.depthMap
@@ -287,7 +288,7 @@ class ARScanViewController: UIViewController {
         guard !spiralCoords.isEmpty else { return }
 
         let total = spiralCoords.count
-        for i in 0..<BATCH_PER_FRAME {
+        for i in 0..<samplesPerFrame {
             let (pxRaw, pyRaw) = spiralCoords[(spiralPhase + i) % total]
             let px = Int(pxRaw); let py = Int(pyRaw)
             let d = depthPtr[py * dW + px]
@@ -298,11 +299,11 @@ class ARScanViewController: UIViewController {
             // preventing unbounded growth that can crash older devices.
             let projected = totalPointsSent + batchPos.count
             let keepEvery: Int
-            if projected < 2_000_000 {
+            if projected < 4_000_000 {
                 keepEvery = 1
-            } else if projected < 4_000_000 {
-                keepEvery = 2
             } else if projected < 8_000_000 {
+                keepEvery = 2
+            } else if projected < 14_000_000 {
                 keepEvery = 3
             } else {
                 keepEvery = 4
@@ -322,7 +323,7 @@ class ARScanViewController: UIViewController {
             batchPos.append(Float3(x: wp.x, y: wp.y, z: wp.z))
             batchCol.append(Float3(x: r,    y: g,    z: b   ))
         }
-        spiralPhase = (spiralPhase + BATCH_PER_FRAME) % total
+        spiralPhase = (spiralPhase + samplesPerFrame) % total
     }
 
     /// Improved YCbCr→RGB: BT.709 coefficients, proper video-range scaling,
@@ -365,91 +366,6 @@ class ARScanViewController: UIViewController {
         let g = min(1, max(0, Y - 0.1873 * Cb - 0.4681 * Cr))
         let b = min(1, max(0, Y + 1.8556 * Cb))
         return (r, g, b)
-    }
-
-    // MARK: - Snapshot capture
-    // Captures a 960-px-wide JPEG of the current camera frame along with the
-    // camera's world transform and intrinsics.  The web app uses these to
-    // re-project each LiDAR point through the best-covering snapshot and replace
-    // its low-res depth-sensor colour with the true high-res photo colour.
-    private func captureSnapshot(_ frame: ARFrame) {
-        guard !isCapturing else { return }
-        isCapturing = true
-
-        let pixBuf = frame.capturedImage
-        let origW  = CVPixelBufferGetWidth(pixBuf)
-        let origH  = CVPixelBufferGetHeight(pixBuf)
-
-        // Scale to 640 wide for a safer memory profile on long scans.
-        let targetW: CGFloat = 640
-        let scale            = targetW / CGFloat(origW)
-        let targetH          = CGFloat(origH) * scale
-
-        let ci     = CIImage(cvPixelBuffer: pixBuf)
-        let scaled = ci.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-
-        guard let cgImg    = ciContext.createCGImage(scaled, from: scaled.extent),
-              let jpegData = UIImage(cgImage: cgImg).jpegData(compressionQuality: 0.58)
-        else { isCapturing = false; return }
-
-        // Camera world transform — column-major 16 floats
-        // ARKit: camera looks along -Z; Y is up; transform = camera→world matrix.
-        let c = frame.camera.transform
-        let transform: [Float] = [
-            c.columns.0.x, c.columns.0.y, c.columns.0.z, c.columns.0.w,
-            c.columns.1.x, c.columns.1.y, c.columns.1.z, c.columns.1.w,
-            c.columns.2.x, c.columns.2.y, c.columns.2.z, c.columns.2.w,
-            c.columns.3.x, c.columns.3.y, c.columns.3.z, c.columns.3.w,
-        ]
-
-        // Intrinsics scaled to the output JPEG resolution.
-        // frame.camera.intrinsics is column-major simd_float3x3:
-        //   col0 = (fx, 0, 0), col1 = (0, fy, 0), col2 = (cx, cy, 1)
-        let intr = frame.camera.intrinsics
-        let sx   = Float(scale)
-        let sy   = Float(scale)
-        let intrinsics: [Float] = [
-            intr[0][0] * sx,  // fx
-            intr[1][1] * sy,  // fy
-            intr[2][0] * sx,  // cx
-            intr[2][1] * sy,  // cy
-            Float(targetW),   // imageWidth
-            Float(targetH),   // imageHeight
-        ]
-
-        ARBridge.shared.sendSnapshot(jpegData, transform: transform, intrinsics: intrinsics)
-        lastSnapshotPos = SIMD3<Float>(c.columns.3.x, c.columns.3.y, c.columns.3.z)
-        lastSnapshotFwd = simd_normalize(SIMD3<Float>(-c.columns.2.x, -c.columns.2.y, -c.columns.2.z))
-        isCapturing = false
-    }
-
-    private func shouldCaptureSnapshot(_ frame: ARFrame) -> Bool {
-        // Require robust tracking to avoid smear from unstable pose estimates.
-        switch frame.camera.trackingState {
-        case .normal:
-            break
-        default:
-            return false
-        }
-
-        let c = frame.camera.transform
-        let pos = SIMD3<Float>(c.columns.3.x, c.columns.3.y, c.columns.3.z)
-        let fwd = simd_normalize(SIMD3<Float>(-c.columns.2.x, -c.columns.2.y, -c.columns.2.z))
-
-        if let lp = lastFramePos, let lf = lastFrameFwd, let ts = lastFrameTs {
-            let dt = max(1e-3, Float(frame.timestamp - ts))
-            let linearSpeed = simd_length(pos - lp) / dt
-            let dotv = max(-1.0, min(1.0, simd_dot(fwd, lf)))
-            let angularSpeed = acos(dotv) / dt
-            if linearSpeed > SNAPSHOT_MAX_LINEAR_SPEED || angularSpeed > SNAPSHOT_MAX_ANGULAR_SPEED {
-                return false
-            }
-        }
-
-        guard let lastPos = lastSnapshotPos, let lastFwd = lastSnapshotFwd else { return true }
-        let moved = simd_length(pos - lastPos)
-        let dotv = simd_dot(fwd, lastFwd)
-        return moved >= SNAPSHOT_MIN_MOVE || dotv <= SNAPSHOT_MIN_ROT_DOT
     }
 
     private func previewBatch(pos: [Float3], col: [Float3]) -> ([Float3], [Float3]) {
@@ -581,25 +497,40 @@ extension ARScanViewController: ARSessionDelegate {
         let curPos = SIMD3<Float>(c.columns.3.x, c.columns.3.y, c.columns.3.z)
         let curFwd = simd_normalize(SIMD3<Float>(-c.columns.2.x, -c.columns.2.y, -c.columns.2.z))
 
-        frameIndex += 1
-        guard frameIndex % SAMPLE_EVERY == 0 else { return }
+        var linearSpeed: Float = 0
+        var angularSpeed: Float = 0
+        if let lp = lastFramePos, let lf = lastFrameFwd, let ts = lastFrameTs {
+            let dt = max(1e-3, Float(frame.timestamp - ts))
+            linearSpeed = simd_length(curPos - lp) / dt
+            let dotv = max(-1.0, min(1.0, simd_dot(curFwd, lf)))
+            angularSpeed = acos(dotv) / dt
+        }
 
-        processFrame(frame)
+        frameIndex += 1
+        guard frameIndex % SAMPLE_EVERY == 0 else {
+            lastFramePos = curPos
+            lastFrameFwd = curFwd
+            lastFrameTs = frame.timestamp
+            return
+        }
+
+        // Ignore depth capture during very rapid motion where pose uncertainty spikes.
+        if linearSpeed > CAPTURE_MAX_LINEAR_SPEED || angularSpeed > CAPTURE_MAX_ANGULAR_SPEED {
+            lastFramePos = curPos
+            lastFrameFwd = curFwd
+            lastFrameTs = frame.timestamp
+            return
+        }
+
+        let sampleBudget = samplesForMotion(linearSpeed: linearSpeed, angularSpeed: angularSpeed)
+
+        processFrame(frame, samplesPerFrame: sampleBudget)
+        maybeCapture(frame: frame, currentPos: curPos)
 
         sampledFrames += 1
         if sampledFrames >= BATCH_FLUSH {
             sampledFrames = 0
             flushBatchToScene()
-        }
-
-        // Photo snapshot — every SNAPSHOT_EVERY sampled frames, up to MAX_SNAPSHOTS
-        snapshotFrameCount += 1
-        if snapshotFrameCount >= SNAPSHOT_EVERY && snapshotCount < MAX_SNAPSHOTS {
-            snapshotFrameCount = 0
-            if shouldCaptureSnapshot(frame) {
-                snapshotCount += 1
-                captureSnapshot(frame)
-            }
         }
 
         lastFramePos = curPos
@@ -609,5 +540,68 @@ extension ARScanViewController: ARSessionDelegate {
 
     func session(_ session: ARSession, didFailWithError error: Error) {
         dismiss(animated: true) { [weak self] in self?.onComplete?([]) }
+    }
+
+    // MARK: - Snapshot capture
+
+    /// Capture one JPEG snapshot + camera matrices if the camera has moved
+    /// at least SNAPSHOT_MIN_MOVE metres since the last snapshot.
+    /// Runs the JPEG encode on a background thread to avoid stalling the AR loop.
+    private func maybeCapture(frame: ARFrame, currentPos: SIMD3<Float>) {
+        guard snapshotIndex < SNAPSHOT_MAX_COUNT else { return }
+        snapshotFrameCounter += 1
+        guard snapshotFrameCounter >= SNAPSHOT_INTERVAL_FRAMES else { return }
+
+        if let lastPos = lastSnapshotPos,
+           simd_distance(currentPos, lastPos) < SNAPSHOT_MIN_MOVE { return }
+
+        snapshotFrameCounter = 0
+        lastSnapshotPos = currentPos
+
+        // Copy only what we need — the CVPixelBuffer must not be held across frames.
+        let pixBuf    = frame.capturedImage
+        let transform = frame.camera.transform
+        let intr      = frame.camera.intrinsics
+        let res       = frame.camera.imageResolution
+        let fullW     = Int(res.width)
+        let fullH     = Int(res.height)
+
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+
+            // Scale to 25 % (e.g. 4032×3024 → 1008×756)
+            let ciCtx   = CIContext()
+            let ciImg   = CIImage(cvPixelBuffer: pixBuf)
+            let scaled  = ciImg.transformed(by: CGAffineTransform(scaleX: 0.25, y: 0.25))
+            guard let cgImg = ciCtx.createCGImage(scaled, from: scaled.extent) else { return }
+            let uiImg   = UIImage(cgImage: cgImg)
+            guard let jpegData = uiImg.jpegData(compressionQuality: 0.80) else { return }
+
+            // Column-major 4×4 camera-to-world (matches ARKit storage order)
+            let c2w: [Float] = [
+                transform.columns.0.x, transform.columns.0.y, transform.columns.0.z, transform.columns.0.w,
+                transform.columns.1.x, transform.columns.1.y, transform.columns.1.z, transform.columns.1.w,
+                transform.columns.2.x, transform.columns.2.y, transform.columns.2.z, transform.columns.2.w,
+                transform.columns.3.x, transform.columns.3.y, transform.columns.3.z, transform.columns.3.w,
+            ]
+            // Column-major 3×3 intrinsics (matches ARKit storage order)
+            let K: [Float] = [
+                intr.columns.0.x, intr.columns.0.y, intr.columns.0.z,
+                intr.columns.1.x, intr.columns.1.y, intr.columns.1.z,
+                intr.columns.2.x, intr.columns.2.y, intr.columns.2.z,
+            ]
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                let idx = self.snapshotIndex
+                self.snapshotIndex += 1
+                ARBridge.shared.sendSnapshot(index: idx,
+                                             jpeg: jpegData,
+                                             c2w: c2w,
+                                             K: K,
+                                             fw: fullW,
+                                             fh: fullH)
+            }
+        }
     }
 }
