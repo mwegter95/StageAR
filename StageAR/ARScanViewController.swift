@@ -64,9 +64,11 @@ class ARScanViewController: UIViewController {
     private var lastSnapshotPos: SIMD3<Float>? = nil
     private var snapshotFrameCounter = 0
     private var snapshotIndex = 0
-    private let SNAPSHOT_INTERVAL_FRAMES = 45  // ~0.75 s at 60 fps; enough to move
-    private let SNAPSHOT_MIN_MOVE: Float   = 0.20 // 20 cm minimum between snapshots
-    private let SNAPSHOT_MAX_COUNT         = 15
+    private var pendingSnapshotEncodes = 0
+    private var isFinishingScan = false
+    private let SNAPSHOT_INTERVAL_FRAMES = 24  // ~0.4 s at 60 fps
+    private let SNAPSHOT_MIN_MOVE: Float   = 0.12 // 12 cm minimum between snapshots
+    private let SNAPSHOT_MAX_COUNT         = 24
 
     // Root node that holds all batch child nodes
     private var pointCloudNode: SCNNode!
@@ -198,13 +200,22 @@ class ARScanViewController: UIViewController {
     // MARK: - Actions
 
     @objc private func doneTapped() {
+        doneButton.isEnabled = false
+        isFinishingScan = true
         sceneView.session.pause()
+        flushBatchToScene()
         // Release preview nodes before dismiss to avoid retaining large SceneKit buffers.
         let children = pointCloudNode.childNodes
         for node in children {
             node.geometry = nil
             node.removeFromParentNode()
         }
+        finishScanIfReady()
+    }
+
+    private func finishScanIfReady() {
+        guard isFinishingScan, pendingSnapshotEncodes == 0 else { return }
+        isFinishingScan = false
         let total = totalPointsSent
         dismiss(animated: true) { [weak self] in
             self?.onComplete?([])              // point data already streamed via chunks
@@ -548,6 +559,7 @@ extension ARScanViewController: ARSessionDelegate {
     /// at least SNAPSHOT_MIN_MOVE metres since the last snapshot.
     /// Runs the JPEG encode on a background thread to avoid stalling the AR loop.
     private func maybeCapture(frame: ARFrame, currentPos: SIMD3<Float>) {
+        guard !isFinishingScan else { return }
         guard snapshotIndex < SNAPSHOT_MAX_COUNT else { return }
         snapshotFrameCounter += 1
         guard snapshotFrameCounter >= SNAPSHOT_INTERVAL_FRAMES else { return }
@@ -565,9 +577,17 @@ extension ARScanViewController: ARSessionDelegate {
         let res       = frame.camera.imageResolution
         let fullW     = Int(res.width)
         let fullH     = Int(res.height)
+        pendingSnapshotEncodes += 1
 
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
+            defer {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.pendingSnapshotEncodes = max(0, self.pendingSnapshotEncodes - 1)
+                    self.finishScanIfReady()
+                }
+            }
 
             // Scale to 25 % (e.g. 4032×3024 → 1008×756)
             let ciCtx   = CIContext()
