@@ -162,8 +162,9 @@ final class ARBridge: NSObject {
         let c2wStr = c2w.map { String($0) }.joined(separator: ",")
         let kStr   = K.map   { String($0) }.joined(separator: ",")
         let b64    = jpeg.base64EncodedString()
+        // Server batch endpoint expects {"snapshots":[{"jpeg":"...","c2w":[...],"K":[...],"fw":N,"fh":N}]}
         let body   = """
-        {"index":\(index),"jpeg":"\(b64)","c2w":[\(c2wStr)],"K":[\(kStr)],"fw":\(fw),"fh":\(fh)}
+        {"snapshots":[{"jpeg":"\(b64)","c2w":[\(c2wStr)],"K":[\(kStr)],"fw":\(fw),"fh":\(fh)}]}
         """
         guard let bodyData = body.data(using: .utf8) else { return }
         var req = URLRequest(url: url)
