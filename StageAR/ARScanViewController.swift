@@ -320,7 +320,12 @@ class ARScanViewController: UIViewController {
 
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                // Stream the colored cloud to JS in 100 000-point chunks to minimise WKWebView evals.
+                // Start iOS → backend upload immediately (concurrent with chunk streaming).
+                // This bypasses the browser XHR so save is near-instant from JS perspective:
+                // JS just waits for the 'uploadComplete' message instead of running its own XHR.
+                ARBridge.shared.uploadPointCloudDirect(floats: coloredCloud)
+
+                // Stream the colored cloud to JS in 100 000-point chunks for in-memory display.
                 let chunkFloats = 100_000 * 6
                 var offset = 0
                 while offset < coloredCloud.count {

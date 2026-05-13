@@ -112,6 +112,42 @@ final class ARBridge: NSObject {
         send("{ status: 'snapshot', index: \(index), snapshot: { jpeg:'\(b64)', c2w:[\(c2wStr)], K:[\(kStr)], fw:\(fw), fh:\(fh) } }")
     }
 
+    /// Upload the full colored point cloud directly from iOS to the backend (bypasses WKWebView).
+    /// When complete, sends { status: 'uploadComplete', url: '...' } to JS so SpaceBuilder
+    /// can skip the browser XHR and just use the URL that's already on the server.
+    func uploadPointCloudDirect(floats: [Float]) {
+        guard let base = apiBase, let rid = roomId,
+              let url  = URL(string: "\(base)/api/rooms/\(rid)/pointcloud") else {
+            print("[ARBridge] uploadPointCloudDirect skipped — no apiBase/roomId")
+            return
+        }
+        let data = floats.withUnsafeBytes { Data($0) }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+        if let auth = authToken   { req.setValue(auth, forHTTPHeaderField: "Authorization") }
+        if let dev  = deviceToken { req.setValue(dev,  forHTTPHeaderField: "X-Device-Token") }
+        req.httpBody = data
+        URLSession.shared.dataTask(with: req) { [weak self] respData, _, err in
+            if let err { print("[ARBridge] uploadPointCloudDirect failed: \(err)"); return }
+            guard let respData,
+                  let json = try? JSONSerialization.jsonObject(with: respData) as? [String: Any],
+                  let urlPath = json["url"] as? String else {
+                print("[ARBridge] uploadPointCloudDirect: unexpected response")
+                return
+            }
+            self?.sendUploadComplete(url: urlPath)
+        }.resume()
+    }
+
+    /// Notify JS that the iOS-side point cloud upload finished.
+    private func sendUploadComplete(url: String) {
+        let safe = url
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "'",  with: "\\'")
+        send("{ status: 'uploadComplete', url: '\(safe)' }")
+    }
+
     /// Upload one JPEG snapshot directly to the backend via URLSession (bypasses WKWebView).
     /// Fire-and-forget — failures are logged but don't block the scan.
     func uploadSnapshotDirect(index: Int, jpeg: Data, c2w: [Float], K: [Float], fw: Int, fh: Int) {
