@@ -308,9 +308,11 @@ enum PhotoProjector {
                                 Float(snap.pixels[i+2]) / 255.0)
         }
 
-        return px3(x0,y0) * ((1-dx)*(1-dy))
-             + px3(x1,y0) * (dx    *(1-dy))
-             + px3(x0,y1) * ((1-dx)*dy    )
-             + px3(x1,y1) * (dx    *dy    )
+        let w00: Float = (1 - dx) * (1 - dy)
+        let w10: Float = dx       * (1 - dy)
+        let w01: Float = (1 - dx) * dy
+        let w11: Float = dx       * dy
+        return px3(x0, y0) * w00 + px3(x1, y0) * w10
+             + px3(x0, y1) * w01 + px3(x1, y1) * w11
     }
 }
