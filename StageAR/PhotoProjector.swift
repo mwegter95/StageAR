@@ -25,19 +25,25 @@
  *
  *       score = fx · depth / r²    (computed entirely from camera-space coords)
  *
+ * COORDINATE CONVENTIONS
+ * ----------------------
+ * ARKit camera space: X right, Y up, Z toward viewer (camera looks along −Z).
+ * Image pixel space:  X right, Y downward (origin at top-left).
+ * Therefore the correct projection from camera to image is:
+ *
+ *       u =  fx * x_cam / depth + cx
+ *       v =  fy * (-y_cam) / depth + cy    ← Y must be negated
+ *
+ * ARKit capturedImage is ALWAYS in sensor-native landscape orientation
+ * (e.g. 4032×3024 or 1008×756 after scaling). CIImage/CVPixelBuffer never
+ * applies rotation. No orientation detection is needed or appropriate.
+ *
  * VISIBILITY
  * ----------
  * A per-snapshot z-buffer built from the raw point cloud gates the projection:
  * a point's photo sample is only accepted if its reprojected depth is within
  * a tolerance of the shallowest observed depth at that pixel, preventing
  * back-wall bleeding through foreground geometry.
- *
- * ORIENTATION DETECTION
- * ---------------------
- * iPhone JPEGs are sometimes stored rotated relative to the ARKit camera frame.
- * For each snapshot we test all four 90° orientations (0°/90°CW/180°/270°CW)
- * against a sparse subset of the point cloud and pick the orientation that
- * projects the most points inside the image bounds.
  */
 
 import Foundation
@@ -68,14 +74,14 @@ enum PhotoProjector {
         let zH: Int                  // z-buffer height = ⌈H / Z_SCALE⌉
         let w2c: simd_float4x4       // world-to-camera
         let fx, fy, cx, cy: Float    // intrinsics in full-res pixel coords
-        let fw, fh: Float
-        var ori: Int = 0             // best JPEG orientation (0–3), set after detection
-        var zbuf: [Float] = []       // shallowest depth per z-buffer cell, filled after ori
+        // Precomputed scale from full-res intrinsic frame to decoded JPEG pixels.
+        // ARKit capturedImage is always landscape-native; no rotation needed.
+        let scaleX: Float            // = Float(W) / Float(fw)
+        let scaleY: Float            // = Float(H) / Float(fh)
+        var zbuf: [Float] = []       // shallowest depth per z-buffer cell, filled after build
     }
 
     // Depth tolerance for z-buffer gating: absolute floor + fraction of reference depth.
-    // Generous tolerances absorb the slight positional drift between the raw point cloud
-    // (used to build the z-buffer) and the actual surface being projected.
     private static let Z_SCALE: Float    = 2.0
     private static let TOL_ABS: Float    = 0.08   // metres absolute floor
     private static let TOL_REL: Float    = 0.03   // fraction of z_ref
@@ -106,8 +112,7 @@ enum PhotoProjector {
         guard !snaps.isEmpty else { return }
         progress?(0.15)
 
-        // 2. Build a strided XYZ subset (≤ 350 K points) for visibility and
-        //    orientation detection — we don't need every point for these passes.
+        // 2. Build a strided XYZ subset (≤ 350 K points) for z-buffer construction.
         let subCount = min(pointCount, 350_000)
         let stride   = max(1, pointCount / subCount)
         var subXYZ   = [SIMD3<Float>]()
@@ -119,11 +124,9 @@ enum PhotoProjector {
             idx += stride
         }
 
-        // 3. Per snapshot: detect the correct JPEG orientation, then build the
-        //    z-buffer using that orientation.
+        // 3. Per snapshot: build the z-buffer.
         let nSnaps = Float(snaps.count)
         for si in 0..<snaps.count {
-            snaps[si].ori  = detectOrientation(snap: snaps[si], sub: subXYZ)
             snaps[si].zbuf = buildZBuffer(snap: snaps[si], sub: subXYZ)
             progress?(0.15 + 0.30 * Float(si + 1) / nSnaps)
         }
@@ -148,12 +151,14 @@ enum PhotoProjector {
                 let depth = -zc    // positive depth along optical axis
 
                 // Project to full-resolution camera pixel coordinates.
-                let u = snap.fx * pc.x / depth + snap.cx
-                let v = snap.fy * pc.y / depth + snap.cy
+                // Y is negated because camera-space Y is up, image Y is down.
+                let u =  snap.fx * pc.x         / depth + snap.cx
+                let v =  snap.fy * (-pc.y)      / depth + snap.cy
 
-                // Map to JPEG pixel coordinates using the detected orientation.
-                let (pxf, pyf) = mapOri(u: u, v: v, ori: snap.ori,
-                                         Wf: Wf, Hf: Hf, fw: snap.fw, fh: snap.fh)
+                // Scale to decoded JPEG pixel coordinates.
+                let pxf = u * snap.scaleX
+                let pyf = v * snap.scaleY
+
                 guard pxf >= 0.0, pxf < Wf - 1.0,
                       pyf >= 0.0, pyf < Hf - 1.0 else { continue }
 
@@ -224,32 +229,8 @@ enum PhotoProjector {
         return PrepSnap(pixels: pixels, W: W, H: H, zW: zW, zH: zH,
                         w2c: c2w.inverse,
                         fx: fx, fy: fy, cx: cx, cy: cy,
-                        fw: Float(cap.fw), fh: Float(cap.fh))
-    }
-
-    // MARK: - Orientation detection
-
-    /// Tests all four 90° rotations and returns the one where the most sub-points
-    /// project inside the JPEG bounds. Cap at 5 000 sample points for speed.
-    private static func detectOrientation(snap: PrepSnap, sub: [SIMD3<Float>]) -> Int {
-        let Wf = Float(snap.W);  let Hf = Float(snap.H)
-        var hits = [Int](repeating: 0, count: 4)
-        let step = max(1, sub.count / 5_000)
-        var i = 0
-        while i < sub.count {
-            let p  = sub[i];  i += step
-            let pc = snap.w2c * SIMD4<Float>(p.x, p.y, p.z, 1.0)
-            guard pc.z < -0.05 else { continue }
-            let d = -pc.z
-            let u = snap.fx * pc.x / d + snap.cx
-            let v = snap.fy * pc.y / d + snap.cy
-            for ori in 0..<4 {
-                let (px, py) = mapOri(u: u, v: v, ori: ori,
-                                       Wf: Wf, Hf: Hf, fw: snap.fw, fh: snap.fh)
-                if px >= 0 && px < Wf - 1 && py >= 0 && py < Hf - 1 { hits[ori] += 1 }
-            }
-        }
-        return hits.indices.max(by: { hits[$0] < hits[$1] }) ?? 0
+                        scaleX: Float(W) / Float(cap.fw),
+                        scaleY: Float(H) / Float(cap.fh))
     }
 
     // MARK: - Z-buffer construction
@@ -260,11 +241,11 @@ enum PhotoProjector {
         for p in sub {
             let pc = snap.w2c * SIMD4<Float>(p.x, p.y, p.z, 1.0)
             guard pc.z < -0.05 else { continue }
-            let d = -pc.z
-            let u = snap.fx * pc.x / d + snap.cx
-            let v = snap.fy * pc.y / d + snap.cy
-            let (pxf, pyf) = mapOri(u: u, v: v, ori: snap.ori,
-                                     Wf: Wf, Hf: Hf, fw: snap.fw, fh: snap.fh)
+            let d   = -pc.z
+            let u   =  snap.fx * pc.x    / d + snap.cx
+            let v   =  snap.fy * (-pc.y) / d + snap.cy
+            let pxf = u * snap.scaleX
+            let pyf = v * snap.scaleY
             guard pxf >= 0 && pxf < Wf && pyf >= 0 && pyf < Hf else { continue }
             let zx  = max(0, min(snap.zW - 1, Int(pxf / Z_SCALE + 0.5)))
             let zy  = max(0, min(snap.zH - 1, Int(pyf / Z_SCALE + 0.5)))
@@ -272,23 +253,6 @@ enum PhotoProjector {
             if d < zbuf[idx] { zbuf[idx] = d }
         }
         return zbuf
-    }
-
-    // MARK: - Orientation mapping
-
-    /// Map full-resolution camera pixel (u, v) to JPEG pixel coordinates.
-    ///
-    /// ori: 0 = 0°  1 = 90° CW  2 = 180°  3 = 270° CW
-    @inline(__always)
-    private static func mapOri(u: Float, v: Float, ori: Int,
-                                 Wf: Float, Hf: Float,
-                                 fw: Float, fh: Float) -> (Float, Float) {
-        switch ori {
-        case 0: return (u          * Wf / fw,  v          * Hf / fh)
-        case 1: return ((fh-1-v)   * Wf / fh,  u          * Hf / fw)
-        case 2: return ((fw-1-u)   * Wf / fw,  (fh-1-v)   * Hf / fh)
-        default:return (v          * Wf / fh,  (fw-1-u)   * Hf / fw)
-        }
     }
 
     // MARK: - Bilinear sampling

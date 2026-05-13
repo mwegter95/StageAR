@@ -216,7 +216,7 @@ class ARScanViewController: UIViewController {
 
         let cloud     = accumulatedCloud
         let snapshots = capturedSnapshots
-        let total     = totalPointsSent
+        let total     = accumulatedCloud.count / 6
 
         ARBridge.shared.sendProjecting()
 
@@ -234,8 +234,8 @@ class ARScanViewController: UIViewController {
 
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                // Stream the colored cloud to JS in 2 000-point chunks.
-                let chunkFloats = 2_000 * 6
+                // Stream the colored cloud to JS in 100 000-point chunks to minimise WKWebView evals.
+                let chunkFloats = 100_000 * 6
                 var offset = 0
                 while offset < coloredCloud.count {
                     let end   = min(offset + chunkFloats, coloredCloud.count)
