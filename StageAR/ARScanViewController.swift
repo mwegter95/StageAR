@@ -78,6 +78,15 @@ class ARScanViewController: UIViewController {
     private let PREVIEW_NODE_LIMIT   = 55
     private let PREVIEW_CELL_SIZE: Float = 0.045
 
+    // Stabilization countdown — ARKit needs a few seconds to lock tracking
+    // before depth poses are reliable. During this window we reject all depth
+    // frames so shaky startup motion doesn't corrupt the cloud.
+    private let STABILIZE_SECS: Double = 4.0
+    private var stabilizeUntil: Date   = .distantPast    // set in startARSession
+    private var stabilizeBar: UIView!
+    private var stabilizeBarFill: UIView!
+    private var stabilizeLabel: UILabel!
+
     // MARK: - Lifecycle
 
     override func viewDidLoad() {
@@ -139,6 +148,82 @@ class ARScanViewController: UIViewController {
         doneButton.addTarget(self, action: #selector(doneTapped), for: .touchUpInside)
         blur.contentView.addSubview(doneButton)
 
+        // Stabilization overlay — full-screen centered card
+        let stabOverlay = UIView()
+        stabOverlay.translatesAutoresizingMaskIntoConstraints = false
+        stabOverlay.backgroundColor = UIColor.black.withAlphaComponent(0.55)
+        stabOverlay.tag = 9001
+        view.addSubview(stabOverlay)
+
+        let stabCard = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterialDark))
+        stabCard.translatesAutoresizingMaskIntoConstraints = false
+        stabCard.layer.cornerRadius = 18
+        stabCard.clipsToBounds = true
+        stabOverlay.addSubview(stabCard)
+
+        stabilizeLabel = UILabel()
+        stabilizeLabel.translatesAutoresizingMaskIntoConstraints = false
+        stabilizeLabel.text = "Stabilizing AR tracking…"
+        stabilizeLabel.textColor = .white
+        stabilizeLabel.font = .systemFont(ofSize: 15, weight: .medium)
+        stabilizeLabel.textAlignment = .center
+        stabCard.contentView.addSubview(stabilizeLabel)
+
+        // Progress track
+        let track = UIView()
+        track.translatesAutoresizingMaskIntoConstraints = false
+        track.backgroundColor = UIColor.white.withAlphaComponent(0.15)
+        track.layer.cornerRadius = 3
+        track.clipsToBounds = true
+        stabCard.contentView.addSubview(track)
+
+        stabilizeBarFill = UIView()
+        stabilizeBarFill.translatesAutoresizingMaskIntoConstraints = false
+        stabilizeBarFill.backgroundColor = UIColor(red: 0.20, green: 0.78, blue: 0.60, alpha: 1)
+        stabilizeBarFill.layer.cornerRadius = 3
+        stabilizeBarFill.clipsToBounds = true
+        track.addSubview(stabilizeBarFill)
+        stabilizeBar = track
+
+        let stabHint = UILabel()
+        stabHint.translatesAutoresizingMaskIntoConstraints = false
+        stabHint.text = "Hold the camera steady"
+        stabHint.textColor = UIColor.white.withAlphaComponent(0.55)
+        stabHint.font = .systemFont(ofSize: 12, weight: .regular)
+        stabHint.textAlignment = .center
+        stabCard.contentView.addSubview(stabHint)
+
+        NSLayoutConstraint.activate([
+            stabOverlay.topAnchor.constraint(equalTo: view.topAnchor),
+            stabOverlay.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            stabOverlay.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            stabOverlay.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+
+            stabCard.centerXAnchor.constraint(equalTo: stabOverlay.centerXAnchor),
+            stabCard.centerYAnchor.constraint(equalTo: stabOverlay.centerYAnchor),
+            stabCard.widthAnchor.constraint(equalToConstant: 260),
+
+            stabilizeLabel.topAnchor.constraint(equalTo: stabCard.contentView.topAnchor, constant: 24),
+            stabilizeLabel.leadingAnchor.constraint(equalTo: stabCard.contentView.leadingAnchor, constant: 20),
+            stabilizeLabel.trailingAnchor.constraint(equalTo: stabCard.contentView.trailingAnchor, constant: -20),
+
+            track.topAnchor.constraint(equalTo: stabilizeLabel.bottomAnchor, constant: 14),
+            track.leadingAnchor.constraint(equalTo: stabCard.contentView.leadingAnchor, constant: 20),
+            track.trailingAnchor.constraint(equalTo: stabCard.contentView.trailingAnchor, constant: -20),
+            track.heightAnchor.constraint(equalToConstant: 6),
+
+            stabilizeBarFill.topAnchor.constraint(equalTo: track.topAnchor),
+            stabilizeBarFill.bottomAnchor.constraint(equalTo: track.bottomAnchor),
+            stabilizeBarFill.leadingAnchor.constraint(equalTo: track.leadingAnchor),
+
+            stabHint.topAnchor.constraint(equalTo: track.bottomAnchor, constant: 10),
+            stabHint.leadingAnchor.constraint(equalTo: stabCard.contentView.leadingAnchor, constant: 20),
+            stabHint.trailingAnchor.constraint(equalTo: stabCard.contentView.trailingAnchor, constant: -20),
+            stabHint.bottomAnchor.constraint(equalTo: stabCard.contentView.bottomAnchor, constant: -20),
+        ])
+        // Width starts at 0 — updated each frame in didUpdate
+        stabilizeBarFill.widthAnchor.constraint(equalToConstant: 0).isActive = true
+
         let safeBottom = view.safeAreaLayoutGuide.bottomAnchor
         NSLayoutConstraint.activate([
             blur.leadingAnchor.constraint(equalTo: view.leadingAnchor),
@@ -188,6 +273,7 @@ class ARScanViewController: UIViewController {
             config.frameSemantics = [.sceneDepth]
         }
 
+        stabilizeUntil = Date().addingTimeInterval(STABILIZE_SECS)
         sceneView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
     }
 
@@ -557,6 +643,35 @@ extension ARScanViewController: ARSessionDelegate {
             lastFrameFwd = curFwd
             lastFrameTs = frame.timestamp
             return
+        }
+
+        // During the stabilization window, update the progress bar and skip depth capture.
+        let now = Date()
+        if now < stabilizeUntil {
+            let elapsed  = STABILIZE_SECS - stabilizeUntil.timeIntervalSince(now)
+            let fraction = CGFloat(max(0, min(1, elapsed / STABILIZE_SECS)))
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                let trackW = self.stabilizeBar.bounds.width
+                // Update the width constraint for the fill bar
+                if let wc = self.stabilizeBarFill.constraints.first(where: { $0.firstAttribute == .width }) {
+                    wc.constant = trackW * fraction
+                }
+            }
+            lastFramePos = curPos; lastFrameFwd = curFwd; lastFrameTs = frame.timestamp
+            return
+        }
+
+        // First frame after stabilization — dismiss the overlay
+        if let overlay = view.viewWithTag(9001), !overlay.isHidden {
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                UIView.animate(withDuration: 0.35) {
+                    self.view.viewWithTag(9001)?.alpha = 0
+                } completion: { _ in
+                    self.view.viewWithTag(9001)?.isHidden = true
+                }
+            }
         }
 
         let sampleBudget = samplesForMotion(linearSpeed: linearSpeed, angularSpeed: angularSpeed)
