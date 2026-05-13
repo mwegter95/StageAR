@@ -129,11 +129,16 @@ final class ARBridge: NSObject {
         if let dev  = deviceToken { req.setValue(dev,  forHTTPHeaderField: "X-Device-Token") }
         req.httpBody = data
         URLSession.shared.dataTask(with: req) { [weak self] respData, _, err in
-            if let err { print("[ARBridge] uploadPointCloudDirect failed: \(err)"); return }
+            if let err {
+                print("[ARBridge] uploadPointCloudDirect failed: \(err)")
+                self?.sendUploadComplete(url: "")   // signal failure → JS fallback
+                return
+            }
             guard let respData,
                   let json = try? JSONSerialization.jsonObject(with: respData) as? [String: Any],
                   let urlPath = json["url"] as? String else {
                 print("[ARBridge] uploadPointCloudDirect: unexpected response")
+                self?.sendUploadComplete(url: "")   // signal failure → JS fallback
                 return
             }
             self?.sendUploadComplete(url: urlPath)
