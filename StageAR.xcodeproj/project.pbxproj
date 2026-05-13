@@ -13,6 +13,7 @@
 		6734A2412FACFBB30079DE68 /* ARBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6734A23F2FACFBB20079DE68 /* ARBridge.swift */; };
 		6734A2422FACFBB30079DE68 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6734A2402FACFBB20079DE68 /* ContentView.swift */; };
 		6734A2462FAD08CA0079DE68 /* ARScanViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6734A2452FAD08CA0079DE68 /* ARScanViewController.swift */; };
+		6734A2472FAD08CB0079DE68 /* PhotoProjector.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6734A2482FAD08CB0079DE68 /* PhotoProjector.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -23,6 +24,7 @@
 		6734A23F2FACFBB20079DE68 /* ARBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ARBridge.swift; sourceTree = "<group>"; };
 		6734A2402FACFBB20079DE68 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		6734A2452FAD08CA0079DE68 /* ARScanViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ARScanViewController.swift; sourceTree = "<group>"; };
+		6734A2482FAD08CB0079DE68 /* PhotoProjector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoProjector.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -56,6 +58,7 @@
 			isa = PBXGroup;
 			children = (
 				6734A2452FAD08CA0079DE68 /* ARScanViewController.swift */,
+				6734A2482FAD08CB0079DE68 /* PhotoProjector.swift */,
 				671808E02FAC0081003752DF /* StageARApp.swift */,
 				6734A23F2FACFBB20079DE68 /* ARBridge.swift */,
 				6734A2402FACFBB20079DE68 /* ContentView.swift */,
@@ -144,6 +147,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				6734A2462FAD08CA0079DE68 /* ARScanViewController.swift in Sources */,
+				6734A2472FAD08CB0079DE68 /* PhotoProjector.swift in Sources */,
 				671808E12FAC0081003752DF /* StageARApp.swift in Sources */,
 				6734A2412FACFBB30079DE68 /* ARBridge.swift in Sources */,
 				6734A2422FACFBB30079DE68 /* ContentView.swift in Sources */,
