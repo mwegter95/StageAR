@@ -92,8 +92,13 @@ final class ARBridge: NSObject {
         send("{ status: 'snapshot', index: \(index), snapshot: { jpeg:'\(b64)', c2w:[\(c2wStr)], K:[\(kStr)], fw:\(fw), fh:\(fh) } }")
     }
 
-    /// Called once when the user taps Done. JS already has all points via chunk events.
-    /// Snapshot images are sent earlier via `sendSnapshot` to avoid a huge final payload.
+    /// Signals that on-device photo projection has started.
+    /// JS should show a "Projecting…" state and pause the upload pipeline.
+    func sendProjecting() {
+        send("{ status: 'projecting' }")
+    }
+
+    /// Called once when projection is complete and all colored chunks have been sent.
     func sendDone(pointCount: Int) {
         let ms = Int(Date().timeIntervalSince1970 * 1000)
         send("{ status: 'done', pointCount: \(pointCount), capturedAt: \(ms) }")

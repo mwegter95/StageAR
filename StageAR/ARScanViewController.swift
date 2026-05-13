@@ -31,11 +31,13 @@ class ARScanViewController: UIViewController {
     private var doneButton:  UIButton!
 
     // MARK: - Point cloud state
-    // Points are streamed to JS in real-time via ARBridge.sendChunk().
-    // We no longer accumulate all points in memory — only the live batch.
-    private var totalPointsSent = 0   // cumulative counter, main-thread only
+    // Points are buffered in memory during the scan and photo-projected after Done.
+    // The colored cloud is streamed to JS only after projection completes.
+    private var totalPointsSent   = 0   // cumulative counter, main-thread only
+    private var accumulatedCloud  = [Float]()   // [x,y,z,r,g,b …] — full scan buffer
+    private var capturedSnapshots = [PhotoProjector.SnapshotCapture]()
 
-    // Current in-progress batch waiting to be flushed to the scene + streamed
+    // Current in-progress batch waiting to be flushed to the scene + buffered
     private var batchPos  = [Float3]()
     private var batchCol  = [Float3]()
 
@@ -66,9 +68,9 @@ class ARScanViewController: UIViewController {
     private var snapshotIndex = 0
     private var pendingSnapshotEncodes = 0
     private var isFinishingScan = false
-    private let SNAPSHOT_INTERVAL_FRAMES = 24  // ~0.4 s at 60 fps
-    private let SNAPSHOT_MIN_MOVE: Float   = 0.12 // 12 cm minimum between snapshots
-    private let SNAPSHOT_MAX_COUNT         = 24
+    private let SNAPSHOT_INTERVAL_FRAMES = 12  // ~0.2 s at 60 fps
+    private let SNAPSHOT_MIN_MOVE: Float   = 0.08 // 8 cm minimum between snapshots
+    private let SNAPSHOT_MAX_COUNT         = 48
 
     // Root node that holds all batch child nodes
     private var pointCloudNode: SCNNode!
@@ -167,18 +169,10 @@ class ARScanViewController: UIViewController {
 
         let config = ARWorldTrackingConfiguration()
 
-        // Prefer ultra-wide (0.5×) camera on iPhone 12 Pro+: wider FOV means more room
-        // coverage per frame. Falls back to the default wide-angle on older/non-Pro devices.
-        var cameraLabel = "Wide-angle"
-        if #available(iOS 16.0, *) {
-            let ultraWide = ARWorldTrackingConfiguration.supportedVideoFormats.filter {
-                $0.captureDeviceType == .builtInUltraWideCamera
-            }
-            if let fmt = ultraWide.first {
-                config.videoFormat = fmt
-                cameraLabel = "Ultra-wide 0.5×"
-            }
-        }
+        // Keep ARKit default wide-angle format for better pinhole projection consistency.
+        // Ultra-wide can improve FOV but often introduces stronger residual distortion,
+        // which hurts photo->mesh reprojection quality.
+        let cameraLabel = "Wide-angle"
 
         // Brief camera-mode indicator so the user can confirm which lens is active.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
@@ -216,10 +210,43 @@ class ARScanViewController: UIViewController {
     private func finishScanIfReady() {
         guard isFinishingScan, pendingSnapshotEncodes == 0 else { return }
         isFinishingScan = false
-        let total = totalPointsSent
-        dismiss(animated: true) { [weak self] in
-            self?.onComplete?([])              // point data already streamed via chunks
-            ARBridge.shared.sendDone(pointCount: total)
+
+        countLabel.text = "Projecting…"
+        doneButton.isHidden = true
+
+        let cloud     = accumulatedCloud
+        let snapshots = capturedSnapshots
+        let total     = totalPointsSent
+
+        ARBridge.shared.sendProjecting()
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var coloredCloud = cloud
+            PhotoProjector.project(
+                cloud:      &coloredCloud,
+                pointCount: total,
+                captures:   snapshots
+            ) { pct in
+                DispatchQueue.main.async { [weak self] in
+                    self?.countLabel.text = String(format: "Projecting %.0f%%", pct * 100)
+                }
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                // Stream the colored cloud to JS in 2 000-point chunks.
+                let chunkFloats = 2_000 * 6
+                var offset = 0
+                while offset < coloredCloud.count {
+                    let end   = min(offset + chunkFloats, coloredCloud.count)
+                    ARBridge.shared.sendChunk(Array(coloredCloud[offset..<end]))
+                    offset = end
+                }
+                self.dismiss(animated: true) {
+                    self.onComplete?([])
+                    ARBridge.shared.sendDone(pointCount: total)
+                }
+            }
         }
     }
 
@@ -431,12 +458,11 @@ class ARScanViewController: UIViewController {
             interleaved.append(pos[i].x); interleaved.append(pos[i].y); interleaved.append(pos[i].z)
             interleaved.append(col[i].x); interleaved.append(col[i].y); interleaved.append(col[i].z)
         }
-        ARBridge.shared.sendChunk(interleaved)   // dispatches to main internally
-
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
 
             self.totalPointsSent += pos.count    // main-thread-only counter
+            self.accumulatedCloud.append(contentsOf: interleaved)
 
             let (previewPos, previewCol) = self.previewBatch(pos: pos, col: col)
             if !previewPos.isEmpty {
@@ -613,14 +639,14 @@ extension ARScanViewController: ARSessionDelegate {
 
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                let idx = self.snapshotIndex
                 self.snapshotIndex += 1
-                ARBridge.shared.sendSnapshot(index: idx,
-                                             jpeg: jpegData,
-                                             c2w: c2w,
-                                             K: K,
-                                             fw: fullW,
-                                             fh: fullH)
+                self.capturedSnapshots.append(PhotoProjector.SnapshotCapture(
+                    jpegData: jpegData,
+                    c2w: c2w,
+                    K: K,
+                    fw: fullW,
+                    fh: fullH
+                ))
             }
         }
     }
