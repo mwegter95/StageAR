@@ -6,11 +6,19 @@
  * calls window.onStageARResult() on the web page.
  *
  * Web → Native:
- *   window.webkit.messageHandlers.stageAR.postMessage({ action: 'startScan' })
+ *   window.webkit.messageHandlers.stageAR.postMessage({
+ *     action: 'startScan',
+ *     apiBase: 'https://api.example.com',   // optional — enables direct iOS→backend upload
+ *     roomId: 'abc123',
+ *     authToken: 'Bearer …',
+ *     deviceToken: '…',
+ *   })
  *
  * Native → Web:
  *   window.onStageARResult({ status: 'scanning' })
- *   window.onStageARResult({ status: 'done', pointCount: N, points: […], capturedAt: ms })
+ *   window.onStageARResult({ status: 'projecting' })
+ *   window.onStageARResult({ status: 'chunk', count: N, data: '<base64>' })
+ *   window.onStageARResult({ status: 'done', pointCount: N, capturedAt: ms })
  *   window.onStageARResult({ error: '…' })
  */
 
@@ -21,6 +29,12 @@ final class ARBridge: NSObject {
 
     static let shared = ARBridge()
     weak var webView: WKWebView?
+
+    /// Set by the JS startScan message — enables direct iOS→backend snapshot upload.
+    var apiBase:     String? = nil
+    var roomId:      String? = nil
+    var authToken:   String? = nil
+    var deviceToken: String? = nil
 
     override private init() {}
 
@@ -42,7 +56,13 @@ final class ARBridge: NSObject {
 
     // MARK: - Scan
 
-    private func startScan() {
+    private func startScan(body: [String: Any]) {
+        // Capture optional backend credentials so iOS can upload snapshots directly.
+        apiBase     = body["apiBase"]     as? String
+        roomId      = body["roomId"]      as? String
+        authToken   = body["authToken"]   as? String
+        deviceToken = body["deviceToken"] as? String
+
         guard ARWorldTrackingConfiguration.isSupported else {
             sendError("ARKit is not supported on this device.")
             return
@@ -92,6 +112,30 @@ final class ARBridge: NSObject {
         send("{ status: 'snapshot', index: \(index), snapshot: { jpeg:'\(b64)', c2w:[\(c2wStr)], K:[\(kStr)], fw:\(fw), fh:\(fh) } }")
     }
 
+    /// Upload one JPEG snapshot directly to the backend via URLSession (bypasses WKWebView).
+    /// Fire-and-forget — failures are logged but don't block the scan.
+    func uploadSnapshotDirect(index: Int, jpeg: Data, c2w: [Float], K: [Float], fw: Int, fh: Int) {
+        guard let base = apiBase, let rid = roomId,
+              let url  = URL(string: "\(base)/api/rooms/\(rid)/snapshots") else { return }
+
+        let c2wStr = c2w.map { String($0) }.joined(separator: ",")
+        let kStr   = K.map   { String($0) }.joined(separator: ",")
+        let b64    = jpeg.base64EncodedString()
+        let body   = """
+        {"index":\(index),"jpeg":"\(b64)","c2w":[\(c2wStr)],"K":[\(kStr)],"fw":\(fw),"fh":\(fh)}
+        """
+        guard let bodyData = body.data(using: .utf8) else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let auth = authToken   { req.setValue(auth,  forHTTPHeaderField: "Authorization") }
+        if let dev  = deviceToken { req.setValue(dev,   forHTTPHeaderField: "X-Device-Token") }
+        req.httpBody = bodyData
+        URLSession.shared.dataTask(with: req) { _, _, err in
+            if let err { print("[ARBridge] snapshot upload \(index) failed: \(err)") }
+        }.resume()
+    }
+
     /// Signals that on-device photo projection has started.
     /// JS should show a "Projecting…" state and pause the upload pipeline.
     func sendProjecting() {
@@ -112,7 +156,7 @@ extension ARBridge: WKScriptMessageHandler {
                                didReceive message: WKScriptMessage) {
         guard let body   = message.body as? [String: Any],
               let action = body["action"] as? String else { return }
-        if action == "startScan" { startScan() }
+        if action == "startScan" { startScan(body: body) }
         // stopScan handled natively via the Done button in ARScanViewController
     }
 }

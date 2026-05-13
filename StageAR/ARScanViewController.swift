@@ -752,6 +752,12 @@ extension ARScanViewController: ARSessionDelegate {
                 intr.columns.2.x, intr.columns.2.y, intr.columns.2.z,
             ]
 
+            // Upload snapshot directly to backend (fire-and-forget) if credentials available.
+            ARBridge.shared.uploadSnapshotDirect(
+                index: self.snapshotIndex,
+                jpeg: jpegData, c2w: c2w, K: K, fw: fullW, fh: fullH
+            )
+
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.snapshotIndex += 1
