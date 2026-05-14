@@ -156,15 +156,18 @@ final class ARBridge: NSObject {
     /// Upload one JPEG snapshot directly to the backend via URLSession (bypasses WKWebView).
     /// Fire-and-forget — failures are logged but don't block the scan.
     func uploadSnapshotDirect(index: Int, jpeg: Data, c2w: [Float], K: [Float], fw: Int, fh: Int) {
+        // Use the per-snapshot endpoint so each index is explicit in the URL.
+        // The batch endpoint has no way to know which index a single-item batch belongs to,
+        // so every upload would overwrite snap_000.jpg.
         guard let base = apiBase, let rid = roomId,
-              let url  = URL(string: "\(base)/api/rooms/\(rid)/snapshots") else { return }
+              let url  = URL(string: "\(base)/api/rooms/\(rid)/snapshots/\(index)") else { return }
 
         let c2wStr = c2w.map { String($0) }.joined(separator: ",")
         let kStr   = K.map   { String($0) }.joined(separator: ",")
         let b64    = jpeg.base64EncodedString()
-        // Server batch endpoint expects {"snapshots":[{"jpeg":"...","c2w":[...],"K":[...],"fw":N,"fh":N}]}
+        // Per-snapshot endpoint expects {"snapshot":{"jpeg":"...","c2w":[...],"K":[...],"fw":N,"fh":N}}
         let body   = """
-        {"snapshots":[{"jpeg":"\(b64)","c2w":[\(c2wStr)],"K":[\(kStr)],"fw":\(fw),"fh":\(fh)}]}
+        {"snapshot":{"jpeg":"\(b64)","c2w":[\(c2wStr)],"K":[\(kStr)],"fw":\(fw),"fh":\(fh)}}
         """
         guard let bodyData = body.data(using: .utf8) else { return }
         var req = URLRequest(url: url)
