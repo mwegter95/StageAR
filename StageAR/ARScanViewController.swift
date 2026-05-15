@@ -13,6 +13,7 @@
 import UIKit
 import ARKit
 import SceneKit
+import AVFoundation
 
 class ARScanViewController: UIViewController {
 
@@ -72,6 +73,23 @@ class ARScanViewController: UIViewController {
     private let SNAPSHOT_MIN_MOVE: Float   = 0.08 // 8 cm minimum between snapshots
     private let SNAPSHOT_MAX_COUNT         = 48
 
+    // MARK: - Ultra-wide snapshot session (parallel to ARKit, separate physical sensor)
+    //
+    // The ultra-wide camera (~120° DFOV) is run on a *separate* AVCaptureSession so it
+    // never touches the ARKit config or the LiDAR depth map.  ARKit's main-camera pose
+    // (frame.camera.transform) is used as c2w for all snapshots; the ~1 cm inter-lens
+    // baseline introduces < 0.5° parallax at 1.5 m — well within WPA's ±70° facing
+    // tolerance.  Per-frame intrinsics arrive via kCMSampleBufferAttachmentKey_CameraIntrinsicMatrix
+    // (simd_float3x3, column-major: col0=(fx,0,0), col1=(0,fy,0), col2=(cx,cy,1)).
+    private var uwSession:      AVCaptureSession?
+    private var uwVideoOutput:  AVCaptureVideoDataOutput?
+    private let uwQueue = DispatchQueue(label: "com.stagear.ultrawide", qos: .userInteractive)
+    private let uwFrameLock     = NSLock()
+    private var uwLatestPixelBuf: CVPixelBuffer?
+    private var uwLatestK:        simd_float3x3 = matrix_identity_float3x3
+    private var uwLatestFW:       Int = 0
+    private var uwLatestFH:       Int = 0
+
     // Root node that holds all batch child nodes
     private var pointCloudNode: SCNNode!
     private let PREVIEW_BATCH_TARGET = 5_000
@@ -103,6 +121,7 @@ class ARScanViewController: UIViewController {
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
         sceneView.session.pause()
+        stopUWCaptureSession()
     }
 
     // MARK: - Setup
@@ -267,11 +286,10 @@ class ARScanViewController: UIViewController {
         //   at the wrong world position.  ARKit may also silently ignore the
         //   format when sceneDepth is requested.
         //
-        //   Ultra-wide SNAPSHOTS (not the scan itself) would require a separate
-        //   AVCaptureSession on builtInUltraWideCamera running in parallel,
-        //   using AVCaptureDevice.intrinsicMatrix for K and the ARKit pose for c2w.
-        //   That is a larger refactor tracked separately.
-        let cameraLabel = "Wide-angle"
+        //   Ultra-wide SNAPSHOTS use a separate AVCaptureSession on builtInUltraWideCamera
+        //   (see startUWCaptureSession).  Per-frame K comes from the CMSampleBuffer
+        //   intrinsics attachment; c2w remains the ARKit main-camera pose.
+        let cameraLabel = "Wide + UW snaps"
 
         // Brief camera-mode indicator so the user can confirm which lens is active.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
@@ -289,6 +307,83 @@ class ARScanViewController: UIViewController {
 
         stabilizeUntil = Date().addingTimeInterval(STABILIZE_SECS)
         sceneView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
+        startUWCaptureSession()
+    }
+
+    // MARK: - Ultra-wide capture session
+
+    /// Start a parallel AVCaptureSession on the ultra-wide camera.
+    /// Runs independently of ARKit — never modifies the ARWorldTrackingConfiguration.
+    /// Fails gracefully (prints a log, snapshots fall back to main camera) if unavailable.
+    private func startUWCaptureSession() {
+        guard let device = AVCaptureDevice.default(.builtInUltraWideCamera,
+                                                   for: .video,
+                                                   position: .back) else {
+            print("[UW] Ultra-wide camera unavailable — snapshots will use main camera")
+            return
+        }
+
+        let session = AVCaptureSession()
+        session.beginConfiguration()
+        session.sessionPreset = .high   // 1920 × 1080 — 1024 px target gives ~1024 × 576
+
+        guard let input = try? AVCaptureDeviceInput(device: device),
+              session.canAddInput(input) else {
+            print("[UW] Cannot create/add ultra-wide input")
+            return
+        }
+        session.addInput(input)
+
+        let output = AVCaptureVideoDataOutput()
+        output.alwaysDiscardsLateVideoFrames = true   // always get the freshest frame
+        // Bi-planar full-range YCbCr — same as frame.capturedImage — so the encode
+        // path (CIImage → CGImage → JPEG) works identically for both sources.
+        output.videoSettings = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        ]
+        guard session.canAddOutput(output) else {
+            print("[UW] Cannot add video output to UW session")
+            return
+        }
+        session.addOutput(output)
+
+        // Enable per-frame intrinsic matrix delivery.  The attachment key is
+        // kCMSampleBufferAttachmentKey_CameraIntrinsicMatrix and carries a simd_float3x3
+        // (column-major: col0=(fx,0,0), col1=(0,fy,0), col2=(cx,cy,1)).
+        if let conn = output.connection(with: .video) {
+            if conn.isCameraIntrinsicMatrixDeliverySupported {
+                conn.isCameraIntrinsicMatrixDeliveryEnabled = true
+            }
+            // Leave videoOrientation at its default (AVCaptureVideoOrientationLandscapeRight =
+            // native landscape sensor orientation).  This means pixel (x, y) in the buffer
+            // corresponds directly to the K matrix returned by the intrinsics attachment —
+            // no rotation adjustment is needed.
+        }
+
+        output.setSampleBufferDelegate(self, queue: uwQueue)
+        session.commitConfiguration()
+
+        uwVideoOutput = output
+        uwSession     = session
+        DispatchQueue.global(qos: .userInitiated).async {
+            session.startRunning()
+        }
+    }
+
+    private func stopUWCaptureSession() {
+        // Detach delegate first so no more callbacks fire after we nil the session.
+        uwVideoOutput?.setSampleBufferDelegate(nil, queue: nil)
+        let sessionToStop = uwSession
+        uwSession     = nil
+        uwVideoOutput = nil
+        DispatchQueue.global(qos: .background).async {
+            sessionToStop?.stopRunning()
+        }
+        uwFrameLock.lock()
+        uwLatestPixelBuf = nil
+        uwLatestFW       = 0
+        uwLatestFH       = 0
+        uwFrameLock.unlock()
     }
 
     // MARK: - Actions
@@ -717,7 +812,23 @@ extension ARScanViewController: ARSessionDelegate {
 
     /// Capture one JPEG snapshot + camera matrices if the camera has moved
     /// at least SNAPSHOT_MIN_MOVE metres since the last snapshot.
-    /// Runs the JPEG encode on a background thread to avoid stalling the AR loop.
+    ///
+    /// Image source priority:
+    ///   1. Ultra-wide CVPixelBuffer from the parallel AVCaptureSession (if running).
+    ///      Wider FOV → more wall surface covered per snapshot.  Per-frame intrinsics
+    ///      come from kCMSampleBufferAttachmentKey_CameraIntrinsicMatrix.
+    ///   2. ARKit frame.capturedImage (main camera) — fallback when UW session is
+    ///      unavailable or not yet producing frames.
+    ///
+    /// c2w is ALWAYS frame.camera.transform regardless of image source.  The ~1 cm
+    /// inter-lens baseline introduces < 0.5° parallax at 1.5 m — negligible vs WPA's
+    /// ±70° facing tolerance.
+    ///
+    /// fw/fh sent to the server are the *intrinsics reference-frame* dimensions
+    /// (original full-res), not the JPEG dimensions.  The web formula K[0]/fw and
+    /// K[4]/fh then correctly normalises to [0,1] UV regardless of JPEG scale.
+    ///
+    /// JPEG encode runs on a background thread to avoid stalling the AR loop.
     private func maybeCapture(frame: ARFrame, currentPos: SIMD3<Float>) {
         guard !isFinishingScan else { return }
         guard snapshotIndex < SNAPSHOT_MAX_COUNT else { return }
@@ -730,13 +841,38 @@ extension ARScanViewController: ARSessionDelegate {
         snapshotFrameCounter = 0
         lastSnapshotPos = currentPos
 
-        // Copy only what we need — the CVPixelBuffer must not be held across frames.
-        let pixBuf    = frame.capturedImage
-        let transform = frame.camera.transform
-        let intr      = frame.camera.intrinsics
-        let res       = frame.camera.imageResolution
-        let fullW     = Int(res.width)
-        let fullH     = Int(res.height)
+        // ── Choose image source under the lock ──────────────────────────────
+        // Copying the reference under the lock bumps the CVPixelBuffer retain count,
+        // so the buffer remains valid on the encode queue even after uwQueue overwrites
+        // uwLatestPixelBuf with the next frame.
+        uwFrameLock.lock()
+        let uwPixBuf = uwLatestPixelBuf
+        let uwK      = uwLatestK
+        let uwFW     = uwLatestFW
+        let uwFH     = uwLatestFH
+        uwFrameLock.unlock()
+
+        let useUW = uwPixBuf != nil && uwFW > 0 && uwFH > 0
+
+        let pixBuf:  CVPixelBuffer
+        let fullW:   Int
+        let fullH:   Int
+        let kMatrix: simd_float3x3
+
+        if useUW, let buf = uwPixBuf {
+            pixBuf  = buf
+            fullW   = uwFW
+            fullH   = uwFH
+            kMatrix = uwK
+        } else {
+            pixBuf  = frame.capturedImage
+            let res = frame.camera.imageResolution
+            fullW   = Int(res.width)
+            fullH   = Int(res.height)
+            kMatrix = frame.camera.intrinsics
+        }
+
+        let transform = frame.camera.transform   // always ARKit pose
         pendingSnapshotEncodes += 1
 
         DispatchQueue.global(qos: .utility).async { [weak self] in
@@ -750,22 +886,14 @@ extension ARScanViewController: ARSessionDelegate {
             }
 
             // ── Snapshot encode ──────────────────────────────────────────────
-            // Target 1024 px on the longest side — matches the web SNAP_TEX_MAX_PX
-            // cap so no further downscaling is applied on upload.  The previous
-            // hardcoded 0.25 scale shrank a 1920×1440 ARKit frame to only 480×360,
-            // producing ~50 KB JPEGs that were too low-resolution for the projection
-            // to look sharp.  At 1024 px max we get ~960–1024 px → ~200–350 KB at
-            // quality 0.85, giving 4–6× more per-pixel texture detail for WPA.
-            //
-            // fw/fh (sent to server) remain the original intrinsics reference-frame
-            // dimensions — not the JPEG dimensions — so the web projection formula
-            // K[0]/fw, K[4]/fh correctly normalises to [0,1] UV for any image size.
+            // Target 1024 px on the longest side — matches the web SNAP_TEX_MAX_PX cap
+            // so no further downscaling is applied on upload.
             let targetMaxDim: CGFloat = 1024
             let srcMax   = CGFloat(max(fullW, fullH))
             let iosScale = srcMax > targetMaxDim ? Double(targetMaxDim / srcMax) : 1.0
 
-            // Explicit RGB working colour space so CIContext doesn't silently widen
-            // to a display-P3 gamut that confuses downstream sRGB JPEG readers.
+            // Explicit sRGB working colour space — prevents CIContext from silently
+            // widening to display-P3 which would confuse downstream sRGB JPEG readers.
             let ciCtx = CIContext(options: [.workingColorSpace: CGColorSpaceCreateDeviceRGB()])
             let ciImg = CIImage(cvPixelBuffer: pixBuf)
             let scaled = iosScale < 1.0
@@ -775,21 +903,23 @@ extension ARScanViewController: ARSessionDelegate {
             let uiImg = UIImage(cgImage: cgImg)
             guard let jpegData = uiImg.jpegData(compressionQuality: 0.85) else { return }
 
-            // Column-major 4×4 camera-to-world (matches ARKit storage order)
+            // Column-major 4×4 camera-to-world (ARKit storage order)
             let c2w: [Float] = [
                 transform.columns.0.x, transform.columns.0.y, transform.columns.0.z, transform.columns.0.w,
                 transform.columns.1.x, transform.columns.1.y, transform.columns.1.z, transform.columns.1.w,
                 transform.columns.2.x, transform.columns.2.y, transform.columns.2.z, transform.columns.2.w,
                 transform.columns.3.x, transform.columns.3.y, transform.columns.3.z, transform.columns.3.w,
             ]
-            // Column-major 3×3 intrinsics (matches ARKit storage order)
+            // Column-major 3×3 intrinsics — from UW sampleBuffer attachment or
+            // ARKit frame.camera.intrinsics, whichever source provided the image.
+            // Layout: [fx,0,0, 0,fy,0, cx,cy,1]  (K[0]=fx, K[4]=fy, K[6]=cx, K[7]=cy)
             let K: [Float] = [
-                intr.columns.0.x, intr.columns.0.y, intr.columns.0.z,
-                intr.columns.1.x, intr.columns.1.y, intr.columns.1.z,
-                intr.columns.2.x, intr.columns.2.y, intr.columns.2.z,
+                kMatrix.columns.0.x, kMatrix.columns.0.y, kMatrix.columns.0.z,
+                kMatrix.columns.1.x, kMatrix.columns.1.y, kMatrix.columns.1.z,
+                kMatrix.columns.2.x, kMatrix.columns.2.y, kMatrix.columns.2.z,
             ]
 
-            // Upload snapshot directly to backend (fire-and-forget) if credentials available.
+            // Upload snapshot directly to backend (fire-and-forget).
             ARBridge.shared.uploadSnapshotDirect(
                 index: self.snapshotIndex,
                 jpeg: jpegData, c2w: c2w, K: K, fw: fullW, fh: fullH
@@ -807,5 +937,52 @@ extension ARScanViewController: ARSessionDelegate {
                 ))
             }
         }
+    }
+}
+
+// MARK: - AVCaptureVideoDataOutputSampleBufferDelegate
+
+extension ARScanViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
+
+    /// Called on uwQueue for every ultra-wide video frame.
+    /// Extracts the CVPixelBuffer and per-frame intrinsic matrix, then stores them
+    /// under uwFrameLock for maybeCapture to consume on the ARKit delegate thread.
+    func captureOutput(_ output: AVCaptureOutput,
+                       didOutput sampleBuffer: CMSampleBuffer,
+                       from connection: AVCaptureConnection) {
+        guard let pixelBuf = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        let w = CVPixelBufferGetWidth(pixelBuf)
+        let h = CVPixelBufferGetHeight(pixelBuf)
+
+        // Attempt to read the per-frame intrinsic matrix from the CMSampleBuffer
+        // attachment.  Apple guarantees this is a packed simd_float3x3 (36 bytes)
+        // stored in column-major order: col0=(fx,0,0), col1=(0,fy,0), col2=(cx,cy,1).
+        // When isCameraIntrinsicMatrixDeliveryEnabled=true, this attachment is present
+        // on every frame.  The fallback below is only a safety net.
+        var K: simd_float3x3
+        if let attachData = CMGetAttachment(
+                sampleBuffer,
+                key: kCMSampleBufferAttachmentKey_CameraIntrinsicMatrix,
+                attachmentModeOut: nil) as? Data,
+           attachData.count == MemoryLayout<simd_float3x3>.size {
+            K = attachData.withUnsafeBytes { $0.load(as: simd_float3x3.self) }
+        } else {
+            // Fallback: approximate typical UW focal length (≈0.65× short side)
+            // and principal point at image centre.  Not used in normal operation.
+            let fw = Float(w); let fh = Float(h)
+            let fEst = min(fw, fh) * 0.65
+            K = simd_float3x3(columns: (
+                SIMD3<Float>(fEst,    0,      0),
+                SIMD3<Float>(0,       fEst,   0),
+                SIMD3<Float>(fw * 0.5, fh * 0.5, 1)
+            ))
+        }
+
+        uwFrameLock.lock()
+        uwLatestPixelBuf = pixelBuf
+        uwLatestK        = K
+        uwLatestFW       = w
+        uwLatestFH       = h
+        uwFrameLock.unlock()
     }
 }
