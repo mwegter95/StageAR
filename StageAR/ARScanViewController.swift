@@ -83,12 +83,21 @@ class ARScanViewController: UIViewController {
     // (simd_float3x3, column-major: col0=(fx,0,0), col1=(0,fy,0), col2=(cx,cy,1)).
     private var uwSession:      AVCaptureSession?
     private var uwVideoOutput:  AVCaptureVideoDataOutput?
-    private let uwQueue = DispatchQueue(label: "com.stagear.ultrawide", qos: .userInteractive)
+    // .userInitiated — high enough to receive frames promptly but does NOT preempt
+    // the projection phase (also .userInitiated on global queue).
+    private let uwQueue = DispatchQueue(label: "com.stagear.ultrawide", qos: .userInitiated)
     private let uwFrameLock     = NSLock()
     private var uwLatestPixelBuf: CVPixelBuffer?
     private var uwLatestK:        simd_float3x3 = matrix_identity_float3x3
     private var uwLatestFW:       Int = 0
     private var uwLatestFH:       Int = 0
+    // Shared CIContext — CIContext is thread-safe; creating one per snapshot (up to 48)
+    // exhausts Metal render-pipeline resources and makes createCGImage return nil.
+    // Lazy so it's initialised the first time maybeCapture fires, not at VC load time.
+    private lazy var snapshotCIContext: CIContext = {
+        CIContext(options: [.workingColorSpace: CGColorSpaceCreateDeviceRGB(),
+                            .useSoftwareRenderer: false])
+    }()
 
     // Root node that holds all batch child nodes
     private var pointCloudNode: SCNNode!
@@ -316,23 +325,17 @@ class ARScanViewController: UIViewController {
     /// Runs independently of ARKit — never modifies the ARWorldTrackingConfiguration.
     /// Fails gracefully (prints a log, snapshots fall back to main camera) if unavailable.
     private func startUWCaptureSession() {
+        // All early returns BEFORE beginConfiguration need no cleanup.
         guard let device = AVCaptureDevice.default(.builtInUltraWideCamera,
                                                    for: .video,
                                                    position: .back) else {
             print("[UW] Ultra-wide camera unavailable — snapshots will use main camera")
             return
         }
-
-        let session = AVCaptureSession()
-        session.beginConfiguration()
-        session.sessionPreset = .high   // 1920 × 1080 — 1024 px target gives ~1024 × 576
-
-        guard let input = try? AVCaptureDeviceInput(device: device),
-              session.canAddInput(input) else {
-            print("[UW] Cannot create/add ultra-wide input")
+        guard let input = try? AVCaptureDeviceInput(device: device) else {
+            print("[UW] Cannot create ultra-wide device input")
             return
         }
-        session.addInput(input)
 
         let output = AVCaptureVideoDataOutput()
         output.alwaysDiscardsLateVideoFrames = true   // always get the freshest frame
@@ -341,8 +344,23 @@ class ARScanViewController: UIViewController {
         output.videoSettings = [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
         ]
+
+        // beginConfiguration must ALWAYS be paired with commitConfiguration.
+        // All early returns AFTER this point call commitConfiguration first.
+        let session = AVCaptureSession()
+        session.beginConfiguration()
+        session.sessionPreset = .high   // 1920 × 1080 — 1024 px target gives ~1024 × 576
+
+        guard session.canAddInput(input) else {
+            print("[UW] Cannot add ultra-wide input to session")
+            session.commitConfiguration()
+            return
+        }
+        session.addInput(input)
+
         guard session.canAddOutput(output) else {
             print("[UW] Cannot add video output to UW session")
+            session.commitConfiguration()
             return
         }
         session.addOutput(output)
@@ -406,6 +424,12 @@ class ARScanViewController: UIViewController {
         doneButton.isEnabled = false
         isFinishingScan = true
         sceneView.session.pause()
+        // Stop the UW session immediately — frees camera hardware, pixel buffer pool,
+        // and Metal resources BEFORE PhotoProjector.project() begins allocating memory.
+        // Leaving it running caused Metal pipeline exhaustion (createCGImage → nil →
+        // blank canvas) and OOM crashes during projection on tight-memory devices.
+        // viewWillDisappear also calls stopUWCaptureSession() as a safety net.
+        stopUWCaptureSession()
         flushBatchToScene()
         // Release preview nodes before dismiss to avoid retaining large SceneKit buffers.
         let children = pointCloudNode.childNodes
@@ -906,14 +930,15 @@ extension ARScanViewController: ARSessionDelegate {
             let srcMax   = CGFloat(max(fullW, fullH))
             let iosScale = srcMax > targetMaxDim ? Double(targetMaxDim / srcMax) : 1.0
 
-            // Explicit sRGB working colour space — prevents CIContext from silently
-            // widening to display-P3 which would confuse downstream sRGB JPEG readers.
-            let ciCtx = CIContext(options: [.workingColorSpace: CGColorSpaceCreateDeviceRGB()])
+            // Use the shared CIContext — creating a new one per snapshot allocated a
+            // fresh Metal render pipeline each time; with up to 48 snapshots this
+            // exhausted Metal resources and caused createCGImage to return nil,
+            // leaving capturedSnapshots empty and producing a blank canvas.
             let ciImg = CIImage(cvPixelBuffer: pixBuf)
             let scaled = iosScale < 1.0
                 ? ciImg.transformed(by: CGAffineTransform(scaleX: iosScale, y: iosScale))
                 : ciImg
-            guard let cgImg = ciCtx.createCGImage(scaled, from: scaled.extent) else { return }
+            guard let cgImg = snapshotCIContext.createCGImage(scaled, from: scaled.extent) else { return }
             let uiImg = UIImage(cgImage: cgImg)
             guard let jpegData = uiImg.jpegData(compressionQuality: 0.85) else { return }
 
