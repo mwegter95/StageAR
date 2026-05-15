@@ -994,17 +994,29 @@ extension ARScanViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
         let h = CVPixelBufferGetHeight(pixelBuf)
 
         // Attempt to read the per-frame intrinsic matrix from the CMSampleBuffer
-        // attachment.  Apple guarantees this is a packed simd_float3x3 (36 bytes)
-        // stored in column-major order: col0=(fx,0,0), col1=(0,fy,0), col2=(cx,cy,1).
-        // When isCameraIntrinsicMatrixDeliveryEnabled=true, this attachment is present
-        // on every frame.  The fallback below is only a safety net.
+        // attachment.  Apple stores this as 9 PACKED Float32 values (36 bytes),
+        // column-major: col0=(fx,0,0), col1=(0,fy,0), col2=(cx,cy,1).
+        //
+        // IMPORTANT: Do NOT use `MemoryLayout<simd_float3x3>.size` for the size
+        // check — that returns 48 (Swift adds 4 bytes SIMD padding to each SIMD3<Float>
+        // row: 3 × 16 = 48).  The attachment is 36 bytes, not 48, so a == 48 check
+        // always fails and the fallback K is silently used for every frame.
+        // Use >= 36 and read 9 packed floats manually.
         var K: simd_float3x3
         if let attachData = CMGetAttachment(
                 sampleBuffer,
                 key: kCMSampleBufferAttachmentKey_CameraIntrinsicMatrix,
                 attachmentModeOut: nil) as? Data,
-           attachData.count == MemoryLayout<simd_float3x3>.size {
-            K = attachData.withUnsafeBytes { $0.load(as: simd_float3x3.self) }
+           attachData.count >= 36 {
+            // Read 9 packed Float32 values — avoids the SIMD padding mismatch.
+            K = attachData.withUnsafeBytes { ptr -> simd_float3x3 in
+                let f = ptr.bindMemory(to: Float.self)
+                return simd_float3x3(columns: (
+                    SIMD3<Float>(f[0], f[1], f[2]),   // col0 = (fx,  0,  0)
+                    SIMD3<Float>(f[3], f[4], f[5]),   // col1 = ( 0, fy,  0)
+                    SIMD3<Float>(f[6], f[7], f[8])    // col2 = (cx, cy,  1)
+                ))
+            }
         } else {
             // Fallback: approximate typical UW focal length (≈0.65× short side)
             // and principal point at image centre.  Not used in normal operation.
