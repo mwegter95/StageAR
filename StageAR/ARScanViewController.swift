@@ -87,6 +87,17 @@ class ARScanViewController: UIViewController {
     // the projection phase (also .userInitiated on global queue).
     private let uwQueue = DispatchQueue(label: "com.stagear.ultrawide", qos: .userInitiated)
     private let uwFrameLock     = NSLock()
+    private struct UWFrameSample {
+        let pixelBuf: CVPixelBuffer
+        let K: simd_float3x3
+        let fw: Int
+        let fh: Int
+        let ts: Double   // CMSampleBuffer presentation timestamp (seconds)
+    }
+    private var uwRecentFrames: [UWFrameSample] = []
+    private let UW_MAX_BUFFERED_FRAMES = 8
+    private let UW_MAX_SYNC_DRIFT_SEC: Double = 0.045  // 45 ms max AR↔UW pairing drift
+    private var lastUWFrameSize: (Int, Int)? = nil
     private var uwLatestPixelBuf: CVPixelBuffer?
     private var uwLatestK:        simd_float3x3 = matrix_identity_float3x3
     private var uwLatestFW:       Int = 0
@@ -358,7 +369,15 @@ class ARScanViewController: UIViewController {
         // All early returns AFTER this point call commitConfiguration first.
         let session = AVCaptureSession()
         session.beginConfiguration()
-        session.sessionPreset = .high   // 1920 × 1080 — 1024 px target gives ~1024 × 576
+        // Prefer the highest UW resolution we can sustain alongside ARKit.
+        // Some devices drop to lower presets when multi-camera resources are tight.
+        if session.canSetSessionPreset(.hd1920x1080) {
+            session.sessionPreset = .hd1920x1080
+        } else if session.canSetSessionPreset(.hd1280x720) {
+            session.sessionPreset = .hd1280x720
+        } else {
+            session.sessionPreset = .high
+        }
 
         guard session.canAddInput(input) else {
             print("[UW] Cannot add ultra-wide input to session")
@@ -421,9 +440,11 @@ class ARScanViewController: UIViewController {
             sessionToStop?.stopRunning()
         }
         uwFrameLock.lock()
+        uwRecentFrames.removeAll(keepingCapacity: false)
         uwLatestPixelBuf = nil
         uwLatestFW       = 0
         uwLatestFH       = 0
+        lastUWFrameSize  = nil
         uwFrameLock.unlock()
     }
 
@@ -907,9 +928,9 @@ extension ARScanViewController: ARSessionDelegate {
     ///   2. ARKit frame.capturedImage (main camera) — fallback when UW session is
     ///      unavailable or not yet producing frames.
     ///
-    /// c2w is ALWAYS frame.camera.transform regardless of image source.  The ~1 cm
-    /// inter-lens baseline introduces < 0.5° parallax at 1.5 m — negligible vs WPA's
-    /// ±70° facing tolerance.
+    /// c2w is ALWAYS frame.camera.transform regardless of image source. For ultra-wide,
+    /// we pair the AR pose to the nearest UW frame by timestamp to avoid asynchronous
+    /// frame/pose mismatch artifacts (large-scale duplicated projection).
     ///
     /// fw/fh sent to the server are the *intrinsics reference-frame* dimensions
     /// (original full-res), not the JPEG dimensions.  The web formula K[0]/fw and
@@ -929,14 +950,19 @@ extension ARScanViewController: ARSessionDelegate {
         lastSnapshotPos = currentPos
 
         // ── Choose image source under the lock ──────────────────────────────
-        // Copying the reference under the lock bumps the CVPixelBuffer retain count,
-        // so the buffer remains valid on the encode queue even after uwQueue overwrites
-        // uwLatestPixelBuf with the next frame.
+        // For UW, pick the frame whose timestamp is nearest the current AR frame.
+        // This avoids pairing a stale/future UW image with the current AR pose,
+        // which causes room-wide duplicated projection when the device is moving.
         uwFrameLock.lock()
-        let uwPixBuf = uwLatestPixelBuf
-        let uwK      = uwLatestK
-        let uwFW     = uwLatestFW
-        let uwFH     = uwLatestFH
+        let targetTs = frame.timestamp
+        let bestUW = uwRecentFrames.min(by: {
+            abs($0.ts - targetTs) < abs($1.ts - targetTs)
+        })
+        let uwInSync = bestUW != nil && abs((bestUW?.ts ?? 0) - targetTs) <= UW_MAX_SYNC_DRIFT_SEC
+        let uwPixBuf = uwInSync ? bestUW?.pixelBuf : nil
+        let uwK      = uwInSync ? (bestUW?.K ?? matrix_identity_float3x3) : matrix_identity_float3x3
+        let uwFW     = uwInSync ? (bestUW?.fw ?? 0) : 0
+        let uwFH     = uwInSync ? (bestUW?.fh ?? 0) : 0
         uwFrameLock.unlock()
 
         let useUW = uwPixBuf != nil && uwFW > 0 && uwFH > 0
@@ -1041,6 +1067,8 @@ extension ARScanViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
         guard let pixelBuf = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         let w = CVPixelBufferGetWidth(pixelBuf)
         let h = CVPixelBufferGetHeight(pixelBuf)
+        let t = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+        let ts = t.isFinite ? t : 0
 
         // Read the per-frame intrinsic matrix from the CMSampleBuffer attachment.
         //
@@ -1084,10 +1112,20 @@ extension ARScanViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
         }
 
         uwFrameLock.lock()
+        // Keep the latest frame fields for compatibility/debug and also keep
+        // a short timestamped history for AR↔UW frame matching.
         uwLatestPixelBuf = pixelBuf
         uwLatestK        = K
         uwLatestFW       = w
         uwLatestFH       = h
+        uwRecentFrames.append(UWFrameSample(pixelBuf: pixelBuf, K: K, fw: w, fh: h, ts: ts))
+        if uwRecentFrames.count > UW_MAX_BUFFERED_FRAMES {
+            uwRecentFrames.removeFirst(uwRecentFrames.count - UW_MAX_BUFFERED_FRAMES)
+        }
+        if lastUWFrameSize == nil || lastUWFrameSize!.0 != w || lastUWFrameSize!.1 != h {
+            lastUWFrameSize = (w, h)
+            print("[UW] frame size now \(w)x\(h)")
+        }
         uwFrameLock.unlock()
     }
 }
