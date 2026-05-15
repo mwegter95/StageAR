@@ -254,10 +254,39 @@ class ARScanViewController: UIViewController {
 
         let config = ARWorldTrackingConfiguration()
 
-        // Keep ARKit default wide-angle format for better pinhole projection consistency.
-        // Ultra-wide can improve FOV but often introduces stronger residual distortion,
-        // which hurts photo->mesh reprojection quality.
-        let cameraLabel = "Wide-angle"
+        // ── Camera format selection ──────────────────────────────────────────
+        // Ultra-wide (≈120° FOV) captures ~12× more wall area per photo than the
+        // main lens (≈55° FOV) at the same camera-to-wall distance.  More coverage
+        // per snapshot means the WPA scorer can find a valid camera for more LiDAR
+        // points, reducing uncovered (black) speckle.
+        //
+        // ARKit provides the correct K matrix (frame.camera.intrinsics) and the
+        // correct imageResolution (fw/fh) for whichever video format is active, so
+        // the web projection math needs no changes — it normalises K by fw/fh and
+        // builds UV [0,1] from those, which is format-agnostic.
+        //
+        // Depth semantics (sceneDepth) are always LiDAR-derived and supplied
+        // regardless of which colour camera is active; ARKit handles the inter-lens
+        // parallax alignment internally.
+        var cameraLabel = "Wide-angle"
+        let supportedFormats = ARWorldTrackingConfiguration.supportedVideoFormats
+
+        if #available(iOS 16, *) {
+            // Filter to ultra-wide formats (builtInUltraWideCamera).
+            // Sort by total pixel area descending to prefer the highest-resolution
+            // ultra-wide format available (more detail for both projection and
+            // on-device PhotoProjector).
+            if let ultraWide = supportedFormats
+                .filter({ $0.captureDeviceType == .builtInUltraWideCamera })
+                .sorted(by: {
+                    $0.imageResolution.width * $0.imageResolution.height >
+                    $1.imageResolution.width * $1.imageResolution.height
+                })
+                .first {
+                config.videoFormat = ultraWide
+                cameraLabel = "Ultra-wide"
+            }
+        }
 
         // Brief camera-mode indicator so the user can confirm which lens is active.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
@@ -735,13 +764,31 @@ extension ARScanViewController: ARSessionDelegate {
                 }
             }
 
-            // Scale to 25 % (e.g. 4032×3024 → 1008×756)
-            let ciCtx   = CIContext()
-            let ciImg   = CIImage(cvPixelBuffer: pixBuf)
-            let scaled  = ciImg.transformed(by: CGAffineTransform(scaleX: 0.25, y: 0.25))
+            // ── Snapshot encode ──────────────────────────────────────────────
+            // Target 1024 px on the longest side — matches the web SNAP_TEX_MAX_PX
+            // cap so no further downscaling is applied on upload.  The previous
+            // hardcoded 0.25 scale shrank a 1920×1440 ARKit frame to only 480×360,
+            // producing ~50 KB JPEGs that were too low-resolution for the projection
+            // to look sharp.  At 1024 px max we get ~960–1024 px → ~200–350 KB at
+            // quality 0.85, giving 4–6× more per-pixel texture detail for WPA.
+            //
+            // fw/fh (sent to server) remain the original intrinsics reference-frame
+            // dimensions — not the JPEG dimensions — so the web projection formula
+            // K[0]/fw, K[4]/fh correctly normalises to [0,1] UV for any image size.
+            let targetMaxDim: CGFloat = 1024
+            let srcMax   = CGFloat(max(fullW, fullH))
+            let iosScale = srcMax > targetMaxDim ? Double(targetMaxDim / srcMax) : 1.0
+
+            // Explicit RGB working colour space so CIContext doesn't silently widen
+            // to a display-P3 gamut that confuses downstream sRGB JPEG readers.
+            let ciCtx = CIContext(options: [.workingColorSpace: CGColorSpaceCreateDeviceRGB()])
+            let ciImg = CIImage(cvPixelBuffer: pixBuf)
+            let scaled = iosScale < 1.0
+                ? ciImg.transformed(by: CGAffineTransform(scaleX: iosScale, y: iosScale))
+                : ciImg
             guard let cgImg = ciCtx.createCGImage(scaled, from: scaled.extent) else { return }
-            let uiImg   = UIImage(cgImage: cgImg)
-            guard let jpegData = uiImg.jpegData(compressionQuality: 0.80) else { return }
+            let uiImg = UIImage(cgImage: cgImg)
+            guard let jpegData = uiImg.jpegData(compressionQuality: 0.85) else { return }
 
             // Column-major 4×4 camera-to-world (matches ARKit storage order)
             let c2w: [Float] = [
