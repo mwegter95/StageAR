@@ -109,10 +109,17 @@ class ARScanViewController: UIViewController {
     // before depth poses are reliable. During this window we reject all depth
     // frames so shaky startup motion doesn't corrupt the cloud.
     private let STABILIZE_SECS: Double = 4.0
-    private var stabilizeUntil: Date   = .distantPast    // set in startARSession
+    private var stabilizeUntil: Date   = .distantPast    // set on first ARKit frame
+    private var hasReceivedFirstFrame  = false            // guards the one-time timer start
     private var stabilizeBar: UIView!
     private var stabilizeBarFill: UIView!
     private var stabilizeLabel: UILabel!
+
+    // Warm-up after stabilization: discard the first N depth frames so residual
+    // tracking noise (from the brief period when ARKit finishes convergence)
+    // doesn't produce jumpy dots at scan start.
+    private let WARMUP_FRAMES = 30   // ~0.5 s at 60 fps
+    private var warmupFramesRemaining = 0
 
     // MARK: - Lifecycle
 
@@ -314,7 +321,9 @@ class ARScanViewController: UIViewController {
             config.frameSemantics = [.sceneDepth]
         }
 
-        stabilizeUntil = Date().addingTimeInterval(STABILIZE_SECS)
+        stabilizeUntil = .distantPast   // will be reset on the first ARKit frame
+        hasReceivedFirstFrame = false
+        warmupFramesRemaining = 0
         sceneView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
         startUWCaptureSession()
     }
@@ -798,7 +807,15 @@ extension ARScanViewController: ARSessionDelegate {
         }
 
         // During the stabilization window, update the progress bar and skip depth capture.
+        // The timer starts on the FIRST frame so the bar always starts moving immediately
+        // (avoids the 0.5–2 s black "stuck at 0%" phase that occurred when the timer was
+        // started before ARKit delivered its first frame).
         let now = Date()
+        if !hasReceivedFirstFrame {
+            hasReceivedFirstFrame = true
+            stabilizeUntil = now.addingTimeInterval(STABILIZE_SECS)
+        }
+
         if now < stabilizeUntil {
             let elapsed  = STABILIZE_SECS - stabilizeUntil.timeIntervalSince(now)
             let fraction = CGFloat(max(0, min(1, elapsed / STABILIZE_SECS)))
@@ -808,14 +825,16 @@ extension ARScanViewController: ARSessionDelegate {
                 // Update the width constraint for the fill bar
                 if let wc = self.stabilizeBarFill.constraints.first(where: { $0.firstAttribute == .width }) {
                     wc.constant = trackW * fraction
+                    self.stabilizeBarFill.superview?.setNeedsLayout()
                 }
             }
             lastFramePos = curPos; lastFrameFwd = curFwd; lastFrameTs = frame.timestamp
             return
         }
 
-        // First frame after stabilization — dismiss the overlay
+        // First frame after stabilization — dismiss the overlay and start warm-up
         if let overlay = view.viewWithTag(9001), !overlay.isHidden {
+            warmupFramesRemaining = WARMUP_FRAMES
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 UIView.animate(withDuration: 0.35) {
@@ -824,6 +843,17 @@ extension ARScanViewController: ARSessionDelegate {
                     self.view.viewWithTag(9001)?.isHidden = true
                 }
             }
+        }
+
+        // Warm-up: discard the first WARMUP_FRAMES depth frames after stabilization ends.
+        // ARKit tracking continues to converge for a short time after the stabilization
+        // window — the first depth frames can still produce noisy/jumpy dots in the preview.
+        // Skipping processFrame and maybeCapture during this period ensures the scan starts
+        // with a clean, stable pose.
+        if warmupFramesRemaining > 0 {
+            warmupFramesRemaining -= 1
+            lastFramePos = curPos; lastFrameFwd = curFwd; lastFrameTs = frame.timestamp
+            return
         }
 
         let sampleBudget = samplesForMotion(linearSpeed: linearSpeed, angularSpeed: angularSpeed)
