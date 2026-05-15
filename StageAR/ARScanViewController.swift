@@ -354,10 +354,24 @@ class ARScanViewController: UIViewController {
             if conn.isCameraIntrinsicMatrixDeliverySupported {
                 conn.isCameraIntrinsicMatrixDeliveryEnabled = true
             }
-            // Leave videoOrientation at its default (AVCaptureVideoOrientationLandscapeRight =
-            // native landscape sensor orientation).  This means pixel (x, y) in the buffer
-            // corresponds directly to the K matrix returned by the intrinsics attachment —
-            // no rotation adjustment is needed.
+
+            // CRITICAL: Force landscape-right output — matching the native sensor orientation
+            // that ARKit always uses for frame.capturedImage.
+            //
+            // The AVCaptureVideoDataOutput connection defaults to .portrait on iPhone, which
+            // would rotate the pixel buffer to 1080×1920 and issue a portrait-frame K.
+            // The web projection code hardcodes the assumption "K is always in the landscape
+            // sensor frame" (because ARKit capturedImage is always landscape), and applies
+            // a 90° CW UV rotation whenever the JPEG is portrait (ih > iw, ori=1).
+            // If the buffer arrives in portrait, K is already in portrait → ori=1 applies
+            // a second erroneous rotation → every UV maps to the wrong texel → duplication.
+            //
+            // Forcing .landscapeRight gives a 1920×1080 landscape buffer with a
+            // landscape-frame K, a landscape JPEG (iw > ih), and ori=0 — consistent
+            // with ARKit's capturedImage.
+            if conn.isVideoOrientationSupported {
+                conn.videoOrientation = .landscapeRight
+            }
         }
 
         output.setSampleBufferDelegate(self, queue: uwQueue)
