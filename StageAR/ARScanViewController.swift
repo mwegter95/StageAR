@@ -254,39 +254,24 @@ class ARScanViewController: UIViewController {
 
         let config = ARWorldTrackingConfiguration()
 
-        // ── Camera format selection ──────────────────────────────────────────
-        // Ultra-wide (≈120° FOV) captures ~12× more wall area per photo than the
-        // main lens (≈55° FOV) at the same camera-to-wall distance.  More coverage
-        // per snapshot means the WPA scorer can find a valid camera for more LiDAR
-        // points, reducing uncovered (black) speckle.
+        // Keep the default (wide-angle) ARKit video format for LiDAR scanning.
         //
-        // ARKit provides the correct K matrix (frame.camera.intrinsics) and the
-        // correct imageResolution (fw/fh) for whichever video format is active, so
-        // the web projection math needs no changes — it normalises K by fw/fh and
-        // builds UV [0,1] from those, which is format-agnostic.
+        // Why NOT ultra-wide here:
+        //   The LiDAR depth map is physically co-located with the MAIN camera and
+        //   always covers the main camera's FOV, regardless of which color camera
+        //   is selected.  If we set config.videoFormat to builtInUltraWideCamera,
+        //   frame.camera.intrinsics returns ultra-wide K values, but
+        //   frame.sceneDepth.depthMap still covers the main-camera FOV.
+        //   processFrame() uses those K values to unproject depth pixels → the
+        //   ultra-wide K applied to a wide-angle depth map places every 3D point
+        //   at the wrong world position.  ARKit may also silently ignore the
+        //   format when sceneDepth is requested.
         //
-        // Depth semantics (sceneDepth) are always LiDAR-derived and supplied
-        // regardless of which colour camera is active; ARKit handles the inter-lens
-        // parallax alignment internally.
-        var cameraLabel = "Wide-angle"
-        let supportedFormats = ARWorldTrackingConfiguration.supportedVideoFormats
-
-        if #available(iOS 16, *) {
-            // Filter to ultra-wide formats (builtInUltraWideCamera).
-            // Sort by total pixel area descending to prefer the highest-resolution
-            // ultra-wide format available (more detail for both projection and
-            // on-device PhotoProjector).
-            if let ultraWide = supportedFormats
-                .filter({ $0.captureDeviceType == .builtInUltraWideCamera })
-                .sorted(by: {
-                    $0.imageResolution.width * $0.imageResolution.height >
-                    $1.imageResolution.width * $1.imageResolution.height
-                })
-                .first {
-                config.videoFormat = ultraWide
-                cameraLabel = "Ultra-wide"
-            }
-        }
+        //   Ultra-wide SNAPSHOTS (not the scan itself) would require a separate
+        //   AVCaptureSession on builtInUltraWideCamera running in parallel,
+        //   using AVCaptureDevice.intrinsicMatrix for K and the ARKit pose for c2w.
+        //   That is a larger refactor tracked separately.
+        let cameraLabel = "Wide-angle"
 
         // Brief camera-mode indicator so the user can confirm which lens is active.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
