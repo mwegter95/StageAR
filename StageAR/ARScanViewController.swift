@@ -845,13 +845,32 @@ extension ARScanViewController: ARSessionDelegate {
             }
         }
 
-        // Warm-up: discard the first WARMUP_FRAMES depth frames after stabilization ends.
-        // ARKit tracking continues to converge for a short time after the stabilization
-        // window — the first depth frames can still produce noisy/jumpy dots in the preview.
-        // Skipping processFrame and maybeCapture during this period ensures the scan starts
-        // with a clean, stable pose.
+        // Warm-up: run processFrame during the first WARMUP_FRAMES so the Metal pipeline
+        // (which is JIT-compiled on the first SceneKit geometry upload) is hot before the
+        // real scan begins — this eliminates the GPU stutter/jumpiness at scan start.
+        // The accumulated warm-up points are cleared when warm-up ends so the final cloud
+        // contains only stable post-warm-up depth data.
         if warmupFramesRemaining > 0 {
             warmupFramesRemaining -= 1
+            let wBudget = samplesForMotion(linearSpeed: linearSpeed, angularSpeed: angularSpeed)
+            processFrame(frame, samplesPerFrame: wBudget)
+            sampledFrames += 1
+            if sampledFrames >= BATCH_FLUSH { sampledFrames = 0; flushBatchToScene() }
+
+            if warmupFramesRemaining == 0 {
+                // Flush any remaining batch, then discard all warm-up data on the main thread.
+                // The DispatchQueue ordering guarantees the clear runs AFTER the last flush.
+                flushBatchToScene(); sampledFrames = 0
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.accumulatedCloud.removeAll(keepingCapacity: true)
+                    self.totalPointsSent = 0
+                    for node in self.pointCloudNode.childNodes {
+                        node.geometry = nil
+                        node.removeFromParentNode()
+                    }
+                }
+            }
             lastFramePos = curPos; lastFrameFwd = curFwd; lastFrameTs = frame.timestamp
             return
         }
@@ -1023,28 +1042,33 @@ extension ARScanViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
         let w = CVPixelBufferGetWidth(pixelBuf)
         let h = CVPixelBufferGetHeight(pixelBuf)
 
-        // Attempt to read the per-frame intrinsic matrix from the CMSampleBuffer
-        // attachment.  Apple stores this as 9 PACKED Float32 values (36 bytes),
-        // column-major: col0=(fx,0,0), col1=(0,fy,0), col2=(cx,cy,1).
+        // Read the per-frame intrinsic matrix from the CMSampleBuffer attachment.
         //
-        // IMPORTANT: Do NOT use `MemoryLayout<simd_float3x3>.size` for the size
-        // check — that returns 48 (Swift adds 4 bytes SIMD padding to each SIMD3<Float>
-        // row: 3 × 16 = 48).  The attachment is 36 bytes, not 48, so a == 48 check
-        // always fails and the fallback K is silently used for every frame.
-        // Use >= 36 and read 9 packed floats manually.
+        // Apple stores kCMSampleBufferAttachmentKey_CameraIntrinsicMatrix as a
+        // simd_float3x3 in memory.  simd_float3x3 on ARM/x86 is 3 × SIMD3<Float>,
+        // and SIMD3<Float> occupies 16 bytes (4 floats) due to SIMD alignment —
+        // the 4th float is unused padding.  Total: 3 × 16 = 48 bytes.
+        //
+        // Layout: [fx, 0, 0, PAD,  0, fy, 0, PAD,  cx, cy, 1, PAD]
+        //          idx 0-3          idx 4-7          idx 8-11
+        //
+        // A previous version checked `>= 36` and read indices 0-8 packed, which
+        // treats the padding float (f[3]=0) as col1.x, shifts fy to col1.z (K[5]),
+        // and places cx at col2.z (K[8]).  The JS then reads K[4]=0 instead of fy
+        // and K[6]=0 instead of cx → every point fails UV bounds → 0 cameras used.
         var K: simd_float3x3
         if let attachData = CMGetAttachment(
                 sampleBuffer,
                 key: kCMSampleBufferAttachmentKey_CameraIntrinsicMatrix,
                 attachmentModeOut: nil) as? Data,
-           attachData.count >= 36 {
-            // Read 9 packed Float32 values — avoids the SIMD padding mismatch.
+           attachData.count >= 48 {
+            // Skip the 4th (padding) float of each SIMD3<Float> column.
             K = attachData.withUnsafeBytes { ptr -> simd_float3x3 in
                 let f = ptr.bindMemory(to: Float.self)
                 return simd_float3x3(columns: (
-                    SIMD3<Float>(f[0], f[1], f[2]),   // col0 = (fx,  0,  0)
-                    SIMD3<Float>(f[3], f[4], f[5]),   // col1 = ( 0, fy,  0)
-                    SIMD3<Float>(f[6], f[7], f[8])    // col2 = (cx, cy,  1)
+                    SIMD3<Float>(f[0], f[1],  f[2]),   // col0 = (fx,  0,  0), skip f[3]=pad
+                    SIMD3<Float>(f[4], f[5],  f[6]),   // col1 = ( 0, fy,  0), skip f[7]=pad
+                    SIMD3<Float>(f[8], f[9], f[10])    // col2 = (cx, cy,  1), skip f[11]=pad
                 ))
             }
         } else {
