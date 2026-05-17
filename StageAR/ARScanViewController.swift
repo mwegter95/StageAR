@@ -341,6 +341,21 @@ class ARScanViewController: UIViewController {
 
     // MARK: - Ultra-wide capture session
 
+    /// Flash a debug message in the scanning status label for 4 seconds.
+    /// Designed for UW session diagnostics — safe to call from any thread.
+    private func showUWDebug(_ msg: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            let prev = self.countLabel.text
+            self.countLabel.text = msg
+            print("[UW-UI] \(msg)")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { [weak self] in
+                guard let self else { return }
+                if self.countLabel.text == msg { self.countLabel.text = prev }
+            }
+        }
+    }
+
     /// Start a parallel AVCaptureSession on the ultra-wide camera.
     /// Runs independently of ARKit — never modifies the ARWorldTrackingConfiguration.
     /// Fails gracefully (prints a log, snapshots fall back to main camera) if unavailable.
@@ -349,11 +364,15 @@ class ARScanViewController: UIViewController {
         guard let device = AVCaptureDevice.default(.builtInUltraWideCamera,
                                                    for: .video,
                                                    position: .back) else {
-            print("[UW] Ultra-wide camera unavailable — snapshots will use main camera")
+            let msg = "⚠️ UW camera unavailable — main cam only"
+            print("[UW] \(msg)")
+            showUWDebug(msg)
             return
         }
         guard let input = try? AVCaptureDeviceInput(device: device) else {
-            print("[UW] Cannot create ultra-wide device input")
+            let msg = "⚠️ UW: cannot create device input"
+            print("[UW] \(msg)")
+            showUWDebug(msg)
             return
         }
 
@@ -369,25 +388,42 @@ class ARScanViewController: UIViewController {
         // All early returns AFTER this point call commitConfiguration first.
         let session = AVCaptureSession()
         session.beginConfiguration()
-        // Prefer the highest UW resolution we can sustain alongside ARKit.
-        // Some devices drop to lower presets when multi-camera resources are tight.
-        if session.canSetSessionPreset(.hd1920x1080) {
-            session.sessionPreset = .hd1920x1080
-        } else if session.canSetSessionPreset(.hd1280x720) {
-            session.sessionPreset = .hd1280x720
+
+        // Probe all presets so we can log exactly what the device supports alongside ARKit.
+        // NOTE: canSetSessionPreset checks the device in isolation.  startRunning() may still
+        // fail if ARKit holds exclusive camera resources — that failure is caught below.
+        let can1080 = session.canSetSessionPreset(.hd1920x1080)
+        let can720  = session.canSetSessionPreset(.hd1280x720)
+        let canHigh = session.canSetSessionPreset(.high)
+
+        let chosenPreset: AVCaptureSession.Preset
+        let presetLabel: String
+        if can1080 {
+            chosenPreset = .hd1920x1080; presetLabel = "1920×1080"
+        } else if can720 {
+            chosenPreset = .hd1280x720;  presetLabel = "1280×720"
         } else {
-            session.sessionPreset = .high
+            chosenPreset = .high;        presetLabel = ".high(640×480)"
         }
+        session.sessionPreset = chosenPreset
+
+        let probeMsg = "UW probe: can1080=\(can1080) can720=\(can720) canHigh=\(canHigh) → chose \(presetLabel)"
+        print("[UW] \(probeMsg)")
+        showUWDebug(probeMsg)
 
         guard session.canAddInput(input) else {
-            print("[UW] Cannot add ultra-wide input to session")
+            let msg = "⚠️ UW: canAddInput false"
+            print("[UW] \(msg)")
+            showUWDebug(msg)
             session.commitConfiguration()
             return
         }
         session.addInput(input)
 
         guard session.canAddOutput(output) else {
-            print("[UW] Cannot add video output to UW session")
+            let msg = "⚠️ UW: canAddOutput false"
+            print("[UW] \(msg)")
+            showUWDebug(msg)
             session.commitConfiguration()
             return
         }
@@ -423,17 +459,67 @@ class ARScanViewController: UIViewController {
         output.setSampleBufferDelegate(self, queue: uwQueue)
         session.commitConfiguration()
 
+        // Subscribe before startRunning so we never miss an error/interruption event.
+        NotificationCenter.default.addObserver(self,
+            selector: #selector(uwSessionRuntimeError(_:)),
+            name: .AVCaptureSessionRuntimeError, object: session)
+        NotificationCenter.default.addObserver(self,
+            selector: #selector(uwSessionInterrupted(_:)),
+            name: .AVCaptureSessionWasInterrupted, object: session)
+        NotificationCenter.default.addObserver(self,
+            selector: #selector(uwSessionResumed(_:)),
+            name: .AVCaptureSessionInterruptionEnded, object: session)
+
         uwVideoOutput = output
         uwSession     = session
-        DispatchQueue.global(qos: .userInitiated).async {
+
+        // startRunning() is synchronous when called from a background thread — it blocks
+        // until the session starts (or fails).  Check isRunning immediately after return.
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             session.startRunning()
+            let running = session.isRunning
+            let msg = running
+                ? "✅ UW running: \(presetLabel)"
+                : "❌ UW startRunning FAILED (\(presetLabel)) — main cam fallback"
+            print("[UW] \(msg)")
+            self?.showUWDebug(msg)
         }
+    }
+
+    @objc private func uwSessionRuntimeError(_ note: Notification) {
+        let err = note.userInfo?[AVCaptureSessionErrorKey] as? Error
+        let msg = "❌ UW runtime error: \(err?.localizedDescription ?? "unknown")"
+        print("[UW] \(msg)")
+        showUWDebug(msg)
+    }
+
+    @objc private func uwSessionInterrupted(_ note: Notification) {
+        let reasonRaw = note.userInfo?[AVCaptureSessionInterruptionReasonKey] as? Int ?? -1
+        // Reason 1 = VideoDeviceNotAvailableInBackground
+        // Reason 3 = VideoDeviceNotAvailableWithMultipleForegroundApps
+        // Reason 4 = VideoDeviceNotAvailableDueToSystemPressure
+        let msg = "⚠️ UW interrupted (reason=\(reasonRaw))"
+        print("[UW] \(msg)")
+        showUWDebug(msg)
+    }
+
+    @objc private func uwSessionResumed(_ note: Notification) {
+        let msg = "▶️ UW interruption ended — resumed"
+        print("[UW] \(msg)")
+        showUWDebug(msg)
     }
 
     private func stopUWCaptureSession() {
         // Detach delegate first so no more callbacks fire after we nil the session.
         uwVideoOutput?.setSampleBufferDelegate(nil, queue: nil)
         let sessionToStop = uwSession
+        // Remove NotificationCenter observers before niling the session reference
+        // so the object: pointer remains valid during removeObserver.
+        if let s = sessionToStop {
+            NotificationCenter.default.removeObserver(self, name: .AVCaptureSessionRuntimeError, object: s)
+            NotificationCenter.default.removeObserver(self, name: .AVCaptureSessionWasInterrupted, object: s)
+            NotificationCenter.default.removeObserver(self, name: .AVCaptureSessionInterruptionEnded, object: s)
+        }
         uwSession     = nil
         uwVideoOutput = nil
         DispatchQueue.global(qos: .background).async {
@@ -1124,7 +1210,10 @@ extension ARScanViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
         }
         if lastUWFrameSize == nil || lastUWFrameSize!.0 != w || lastUWFrameSize!.1 != h {
             lastUWFrameSize = (w, h)
-            print("[UW] frame size now \(w)x\(h)")
+            let fxVal = Int(K.columns.0.x)
+            let msg = "✅ UW frame: \(w)×\(h) fx=\(fxVal)"
+            print("[UW] \(msg)")
+            DispatchQueue.main.async { [weak self] in self?.showUWDebug(msg) }
         }
         uwFrameLock.unlock()
     }
