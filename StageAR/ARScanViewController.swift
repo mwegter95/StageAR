@@ -359,7 +359,11 @@ class ARScanViewController: UIViewController {
     /// Start a parallel AVCaptureSession on the ultra-wide camera.
     /// Runs independently of ARKit — never modifies the ARWorldTrackingConfiguration.
     /// Fails gracefully (prints a log, snapshots fall back to main camera) if unavailable.
-    private func startUWCaptureSession() {
+    ///
+    /// - Parameter forcedPreset: when non-nil, skip the capability probe and use this
+    ///   preset directly.  Used by the interruption handler to retry at .high after a
+    ///   VideoDeviceNotAvailableWithMultipleForegroundApps conflict with ARKit.
+    private func startUWCaptureSession(forcedPreset: AVCaptureSession.Preset? = nil) {
         // All early returns BEFORE beginConfiguration need no cleanup.
         guard let device = AVCaptureDevice.default(.builtInUltraWideCamera,
                                                    for: .video,
@@ -389,27 +393,37 @@ class ARScanViewController: UIViewController {
         let session = AVCaptureSession()
         session.beginConfiguration()
 
-        // Probe all presets so we can log exactly what the device supports alongside ARKit.
-        // NOTE: canSetSessionPreset checks the device in isolation.  startRunning() may still
-        // fail if ARKit holds exclusive camera resources — that failure is caught below.
-        let can1080 = session.canSetSessionPreset(.hd1920x1080)
-        let can720  = session.canSetSessionPreset(.hd1280x720)
-        let canHigh = session.canSetSessionPreset(.high)
-
         let chosenPreset: AVCaptureSession.Preset
         let presetLabel: String
-        if can1080 {
-            chosenPreset = .hd1920x1080; presetLabel = "1920×1080"
-        } else if can720 {
-            chosenPreset = .hd1280x720;  presetLabel = "1280×720"
+
+        if let forced = forcedPreset {
+            // Retry path — use the explicitly requested preset without probing.
+            chosenPreset = forced
+            presetLabel  = forced == .high ? ".high/640×480(fallback)" : "\(forced)"
+            let msg = "UW retry with forced preset: \(presetLabel)"
+            print("[UW] \(msg)")
+            showUWDebug(msg)
         } else {
-            chosenPreset = .high;        presetLabel = ".high(640×480)"
+            // Probe all presets so we can log exactly what the device supports alongside ARKit.
+            // NOTE: canSetSessionPreset tests the device in isolation.  startRunning() may still
+            // fail if ARKit holds exclusive resources — that failure is caught by the interruption
+            // handler which will call us again with forcedPreset = .high.
+            let can1080 = session.canSetSessionPreset(.hd1920x1080)
+            let can720  = session.canSetSessionPreset(.hd1280x720)
+            let canHigh = session.canSetSessionPreset(.high)
+
+            if can1080 {
+                chosenPreset = .hd1920x1080; presetLabel = "1920×1080"
+            } else if can720 {
+                chosenPreset = .hd1280x720;  presetLabel = "1280×720"
+            } else {
+                chosenPreset = .high;        presetLabel = ".high(640×480)"
+            }
+            let probeMsg = "UW probe: can1080=\(can1080) can720=\(can720) canHigh=\(canHigh) → chose \(presetLabel)"
+            print("[UW] \(probeMsg)")
+            showUWDebug(probeMsg)
         }
         session.sessionPreset = chosenPreset
-
-        let probeMsg = "UW probe: can1080=\(can1080) can720=\(can720) canHigh=\(canHigh) → chose \(presetLabel)"
-        print("[UW] \(probeMsg)")
-        showUWDebug(probeMsg)
 
         guard session.canAddInput(input) else {
             let msg = "⚠️ UW: canAddInput false"
@@ -494,13 +508,27 @@ class ARScanViewController: UIViewController {
     }
 
     @objc private func uwSessionInterrupted(_ note: Notification) {
-        let reasonRaw = note.userInfo?[AVCaptureSessionInterruptionReasonKey] as? Int ?? -1
+        let reasonRaw = (note.userInfo?[AVCaptureSessionInterruptionReasonKey] as? NSNumber)?.intValue ?? -1
         // Reason 1 = VideoDeviceNotAvailableInBackground
-        // Reason 3 = VideoDeviceNotAvailableWithMultipleForegroundApps
+        // Reason 3 = VideoDeviceNotAvailableWithMultipleForegroundApps  ← ARKit resource conflict
         // Reason 4 = VideoDeviceNotAvailableDueToSystemPressure
-        let msg = "⚠️ UW interrupted (reason=\(reasonRaw))"
+        let msg = "⚠️ UW interrupted reason=\(reasonRaw)"
         print("[UW] \(msg)")
         showUWDebug(msg)
+
+        if reasonRaw == 3 || reasonRaw == 4 {
+            // Camera resource conflict with ARKit (reason=3) or system pressure (reason=4).
+            // The chosen preset is too demanding to coexist with ARKit.
+            // Stop the failed session and retry immediately at .high (640×480) which is
+            // known to work alongside ARKit on all tested devices.
+            let retryMsg = "⚠️ UW conflict — retrying at .high(640×480)…"
+            print("[UW] \(retryMsg)")
+            showUWDebug(retryMsg)
+            stopUWCaptureSession()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+                self?.startUWCaptureSession(forcedPreset: .high)
+            }
+        }
     }
 
     @objc private func uwSessionResumed(_ note: Notification) {
