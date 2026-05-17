@@ -193,7 +193,9 @@ class ARScanViewController: UIViewController {
         doneButton.setTitleColor(.white, for: .normal)
         doneButton.backgroundColor = UIColor(red: 0.20, green: 0.78, blue: 0.60, alpha: 1)
         doneButton.layer.cornerRadius = 18
-        doneButton.contentEdgeInsets = UIEdgeInsets(top: 0, left: 22, bottom: 0, right: 22)
+        var doneConfig = doneButton.configuration ?? UIButton.Configuration.filled()
+        doneConfig.contentInsets = NSDirectionalEdgeInsets(top: 0, leading: 22, bottom: 0, trailing: 22)
+        doneButton.configuration = doneConfig
         doneButton.addTarget(self, action: #selector(doneTapped), for: .touchUpInside)
         blur.contentView.addSubview(doneButton)
 
@@ -470,8 +472,16 @@ class ARScanViewController: UIViewController {
             // Forcing .landscapeRight gives a 1920×1080 landscape buffer with a
             // landscape-frame K, a landscape JPEG (iw > ih), and ori=0 — consistent
             // with ARKit's capturedImage.
-            if conn.isVideoOrientationSupported {
-                conn.videoOrientation = .landscapeRight
+            // iOS 17+: use videoRotationAngle instead of deprecated videoOrientation.
+            // 0° = landscape-right (matches ARKit capturedImage orientation).
+            if #available(iOS 17.0, *) {
+                if conn.isVideoRotationAngleSupported(0) {
+                    conn.videoRotationAngle = 0
+                }
+            } else {
+                if conn.isVideoOrientationSupported {
+                    conn.videoOrientation = .landscapeRight
+                }
             }
         }
 
