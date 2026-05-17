@@ -98,6 +98,9 @@ class ARScanViewController: UIViewController {
     private let UW_MAX_BUFFERED_FRAMES = 8
     private let UW_MAX_SYNC_DRIFT_SEC: Double = 0.045  // 45 ms max AR↔UW pairing drift
     private var lastUWFrameSize: (Int, Int)? = nil
+    /// Guards the one-time deferred UW session start (fires on first ARKit frame so
+    /// ARKit has fully claimed its ISP resources before we add the UW camera).
+    private var hasStartedUWSession = false
     private var uwLatestPixelBuf: CVPixelBuffer?
     private var uwLatestK:        simd_float3x3 = matrix_identity_float3x3
     private var uwLatestFW:       Int = 0
@@ -335,8 +338,10 @@ class ARScanViewController: UIViewController {
         stabilizeUntil = .distantPast   // will be reset on the first ARKit frame
         hasReceivedFirstFrame = false
         warmupFramesRemaining = 0
+        hasStartedUWSession = false  // reset so deferred start fires on first ARKit frame
         sceneView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
-        startUWCaptureSession()
+        // UW session is started on the first ARKit frame (see ARSessionDelegate) so ARKit
+        // has fully claimed its ISP resources before we compete for the UW sensor.
     }
 
     // MARK: - Ultra-wide capture session
@@ -949,6 +954,14 @@ extension ARScanViewController: ARSessionDelegate {
         if !hasReceivedFirstFrame {
             hasReceivedFirstFrame = true
             stabilizeUntil = now.addingTimeInterval(STABILIZE_SECS)
+            // Deferred UW start: ARKit has now claimed its ISP resources.
+            // Attempting hd1920x1080 AFTER ARKit is live maximises the chance the
+            // OS can allocate the UW sensor alongside ARKit.  If reason=3 fires,
+            // the interruption handler retries at .high.
+            if !hasStartedUWSession {
+                hasStartedUWSession = true
+                DispatchQueue.main.async { [weak self] in self?.startUWCaptureSession() }
+            }
         }
 
         if now < stabilizeUntil {
