@@ -954,13 +954,23 @@ extension ARScanViewController: ARSessionDelegate {
         if !hasReceivedFirstFrame {
             hasReceivedFirstFrame = true
             stabilizeUntil = now.addingTimeInterval(STABILIZE_SECS)
-            // Deferred UW start: ARKit has now claimed its ISP resources.
-            // Attempting hd1920x1080 AFTER ARKit is live maximises the chance the
-            // OS can allocate the UW sensor alongside ARKit.  If reason=3 fires,
-            // the interruption handler retries at .high.
+            // Deferred UW start — wait until AFTER the stabilization window ends.
+            //
+            // Why: starting hd1920x1080 on the very first ARKit frame competes for
+            // the ISP before ARKit's pipeline is fully established.  Even though
+            // ARKit claimed the sensor first, the UW 1080p session can reduce ARKit
+            // frame delivery to near-zero, which freezes the stabilization progress
+            // bar (it lives inside the ARKit frame callback) so scanning never starts.
+            //
+            // Solution: let stabilization complete uncontested (STABILIZE_SECS), then
+            // bring the UW session up once ARKit is actively delivering depth frames.
+            // 0.5 s extra buffer covers the overlay-dismiss animation + warmup flush.
             if !hasStartedUWSession {
                 hasStartedUWSession = true
-                DispatchQueue.main.async { [weak self] in self?.startUWCaptureSession() }
+                let delay = STABILIZE_SECS + 0.5
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                    self?.startUWCaptureSession()
+                }
             }
         }
 
