@@ -13,7 +13,6 @@
 import UIKit
 import ARKit
 import SceneKit
-import AVFoundation
 
 class ARScanViewController: UIViewController {
 
@@ -73,39 +72,6 @@ class ARScanViewController: UIViewController {
     private let SNAPSHOT_MIN_MOVE: Float   = 0.08 // 8 cm minimum between snapshots
     private let SNAPSHOT_MAX_COUNT         = 48
 
-    // MARK: - Ultra-wide snapshot session (parallel to ARKit, separate physical sensor)
-    //
-    // The ultra-wide camera (~120° DFOV) is run on a *separate* AVCaptureSession so it
-    // never touches the ARKit config or the LiDAR depth map.  ARKit's main-camera pose
-    // (frame.camera.transform) is used as c2w for all snapshots; the ~1 cm inter-lens
-    // baseline introduces < 0.5° parallax at 1.5 m — well within WPA's ±70° facing
-    // tolerance.  Per-frame intrinsics arrive via kCMSampleBufferAttachmentKey_CameraIntrinsicMatrix
-    // (simd_float3x3, column-major: col0=(fx,0,0), col1=(0,fy,0), col2=(cx,cy,1)).
-    private var uwSession:      AVCaptureSession?
-    private var uwVideoOutput:  AVCaptureVideoDataOutput?
-    // .userInitiated — high enough to receive frames promptly but does NOT preempt
-    // the projection phase (also .userInitiated on global queue).
-    private let uwQueue = DispatchQueue(label: "com.stagear.ultrawide", qos: .userInitiated)
-    private let uwFrameLock     = NSLock()
-    private struct UWFrameSample {
-        let pixelBuf: CVPixelBuffer
-        let K: simd_float3x3
-        let fw: Int
-        let fh: Int
-        let ts: Double   // CMSampleBuffer presentation timestamp (seconds)
-    }
-    private var uwRecentFrames: [UWFrameSample] = []
-    private let UW_MAX_BUFFERED_FRAMES = 8
-    private let UW_MAX_SYNC_DRIFT_SEC: Double = 0.045  // 45 ms max AR↔UW pairing drift
-    private var lastUWFrameSize: (Int, Int)? = nil
-    /// Guards the one-time deferred UW session start (fires on first ARKit frame so
-    /// ARKit has fully claimed its ISP resources before we add the UW camera).
-    private var hasStartedUWSession = false
-    private var uwInterruptionCount = 0   // how many times ARKit was interrupted by UW startup
-    private var uwLatestPixelBuf: CVPixelBuffer?
-    private var uwLatestK:        simd_float3x3 = matrix_identity_float3x3
-    private var uwLatestFW:       Int = 0
-    private var uwLatestFH:       Int = 0
     // Shared CIContext — CIContext is thread-safe; creating one per snapshot (up to 48)
     // exhausts Metal render-pipeline resources and makes createCGImage return nil.
     // Lazy so it's initialised the first time maybeCapture fires, not at VC load time.
@@ -152,7 +118,6 @@ class ARScanViewController: UIViewController {
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
         sceneView.session.pause()
-        stopUWCaptureSession()
     }
 
     // MARK: - Setup
@@ -341,242 +306,9 @@ class ARScanViewController: UIViewController {
         stabilizeUntil = .distantPast   // will be reset on the first ARKit frame
         hasReceivedFirstFrame = false
         warmupFramesRemaining = 0
-        hasStartedUWSession = false  // reset so deferred start fires on first ARKit frame
-        uwInterruptionCount = 0      // reset retry budget for a fresh scan
         sceneView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
         // UW session is started on the first ARKit frame (see ARSessionDelegate) so ARKit
         // has fully claimed its ISP resources before we compete for the UW sensor.
-    }
-
-    // MARK: - Ultra-wide capture session
-
-    /// Flash a debug message in the scanning status label for 4 seconds.
-    /// Designed for UW session diagnostics — safe to call from any thread.
-    private func showUWDebug(_ msg: String) {
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            let prev = self.countLabel.text
-            self.countLabel.text = msg
-            print("[UW-UI] \(msg)")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { [weak self] in
-                guard let self else { return }
-                if self.countLabel.text == msg { self.countLabel.text = prev }
-            }
-        }
-    }
-
-    /// Start a parallel AVCaptureSession on the ultra-wide camera.
-    /// Runs independently of ARKit — never modifies the ARWorldTrackingConfiguration.
-    /// Fails gracefully (prints a log, snapshots fall back to main camera) if unavailable.
-    ///
-    /// - Parameter forcedPreset: when non-nil, skip the capability probe and use this
-    ///   preset directly.  Used by the interruption handler to retry at .high after a
-    ///   VideoDeviceNotAvailableWithMultipleForegroundApps conflict with ARKit.
-    private func startUWCaptureSession(forcedPreset: AVCaptureSession.Preset? = nil) {
-        // All early returns BEFORE beginConfiguration need no cleanup.
-        guard let device = AVCaptureDevice.default(.builtInUltraWideCamera,
-                                                   for: .video,
-                                                   position: .back) else {
-            let msg = "⚠️ UW camera unavailable — main cam only"
-            print("[UW] \(msg)")
-            showUWDebug(msg)
-            return
-        }
-        guard let input = try? AVCaptureDeviceInput(device: device) else {
-            let msg = "⚠️ UW: cannot create device input"
-            print("[UW] \(msg)")
-            showUWDebug(msg)
-            return
-        }
-
-        let output = AVCaptureVideoDataOutput()
-        output.alwaysDiscardsLateVideoFrames = true   // always get the freshest frame
-        // Bi-planar full-range YCbCr — same as frame.capturedImage — so the encode
-        // path (CIImage → CGImage → JPEG) works identically for both sources.
-        output.videoSettings = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
-        ]
-
-        // beginConfiguration must ALWAYS be paired with commitConfiguration.
-        // All early returns AFTER this point call commitConfiguration first.
-        let session = AVCaptureSession()
-        session.beginConfiguration()
-
-        let chosenPreset: AVCaptureSession.Preset
-        let presetLabel: String
-
-        if let forced = forcedPreset {
-            // Retry path — use the explicitly requested preset without probing.
-            chosenPreset = forced
-            presetLabel  = forced == .high ? ".high/640×480(fallback)" : "\(forced)"
-            let msg = "UW retry with forced preset: \(presetLabel)"
-            print("[UW] \(msg)")
-            showUWDebug(msg)
-        } else {
-            // Probe all presets so we can log exactly what the device supports alongside ARKit.
-            // NOTE: canSetSessionPreset tests the device in isolation.  startRunning() may still
-            // fail if ARKit holds exclusive resources — that failure is caught by the interruption
-            // handler which will call us again with forcedPreset = .high.
-            let can1080 = session.canSetSessionPreset(.hd1920x1080)
-            let can720  = session.canSetSessionPreset(.hd1280x720)
-            let canHigh = session.canSetSessionPreset(.high)
-
-            if can1080 {
-                chosenPreset = .hd1920x1080; presetLabel = "1920×1080"
-            } else if can720 {
-                chosenPreset = .hd1280x720;  presetLabel = "1280×720"
-            } else {
-                chosenPreset = .high;        presetLabel = ".high(640×480)"
-            }
-            let probeMsg = "UW probe: can1080=\(can1080) can720=\(can720) canHigh=\(canHigh) → chose \(presetLabel)"
-            print("[UW] \(probeMsg)")
-            showUWDebug(probeMsg)
-        }
-        session.sessionPreset = chosenPreset
-
-        guard session.canAddInput(input) else {
-            let msg = "⚠️ UW: canAddInput false"
-            print("[UW] \(msg)")
-            showUWDebug(msg)
-            session.commitConfiguration()
-            return
-        }
-        session.addInput(input)
-
-        guard session.canAddOutput(output) else {
-            let msg = "⚠️ UW: canAddOutput false"
-            print("[UW] \(msg)")
-            showUWDebug(msg)
-            session.commitConfiguration()
-            return
-        }
-        session.addOutput(output)
-
-        // Enable per-frame intrinsic matrix delivery.  The attachment key is
-        // kCMSampleBufferAttachmentKey_CameraIntrinsicMatrix and carries a simd_float3x3
-        // (column-major: col0=(fx,0,0), col1=(0,fy,0), col2=(cx,cy,1)).
-        if let conn = output.connection(with: .video) {
-            if conn.isCameraIntrinsicMatrixDeliverySupported {
-                conn.isCameraIntrinsicMatrixDeliveryEnabled = true
-            }
-
-            // CRITICAL: Force landscape-right output — matching the native sensor orientation
-            // that ARKit always uses for frame.capturedImage.
-            //
-            // The AVCaptureVideoDataOutput connection defaults to .portrait on iPhone, which
-            // would rotate the pixel buffer to 1080×1920 and issue a portrait-frame K.
-            // The web projection code hardcodes the assumption "K is always in the landscape
-            // sensor frame" (because ARKit capturedImage is always landscape), and applies
-            // a 90° CW UV rotation whenever the JPEG is portrait (ih > iw, ori=1).
-            // If the buffer arrives in portrait, K is already in portrait → ori=1 applies
-            // a second erroneous rotation → every UV maps to the wrong texel → duplication.
-            //
-            // Forcing .landscapeRight gives a 1920×1080 landscape buffer with a
-            // landscape-frame K, a landscape JPEG (iw > ih), and ori=0 — consistent
-            // with ARKit's capturedImage.
-            // iOS 17+: use videoRotationAngle instead of deprecated videoOrientation.
-            // 0° = landscape-right (matches ARKit capturedImage orientation).
-            if #available(iOS 17.0, *) {
-                if conn.isVideoRotationAngleSupported(0) {
-                    conn.videoRotationAngle = 0
-                }
-            } else {
-                if conn.isVideoOrientationSupported {
-                    conn.videoOrientation = .landscapeRight
-                }
-            }
-        }
-
-        output.setSampleBufferDelegate(self, queue: uwQueue)
-        session.commitConfiguration()
-
-        // Subscribe before startRunning so we never miss an error/interruption event.
-        NotificationCenter.default.addObserver(self,
-            selector: #selector(uwSessionRuntimeError(_:)),
-            name: .AVCaptureSessionRuntimeError, object: session)
-        NotificationCenter.default.addObserver(self,
-            selector: #selector(uwSessionInterrupted(_:)),
-            name: .AVCaptureSessionWasInterrupted, object: session)
-        NotificationCenter.default.addObserver(self,
-            selector: #selector(uwSessionResumed(_:)),
-            name: .AVCaptureSessionInterruptionEnded, object: session)
-
-        uwVideoOutput = output
-        uwSession     = session
-
-        // startRunning() is synchronous when called from a background thread — it blocks
-        // until the session starts (or fails).  Check isRunning immediately after return.
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            session.startRunning()
-            let running = session.isRunning
-            let msg = running
-                ? "✅ UW running: \(presetLabel)"
-                : "❌ UW startRunning FAILED (\(presetLabel)) — main cam fallback"
-            print("[UW] \(msg)")
-            self?.showUWDebug(msg)
-        }
-    }
-
-    @objc private func uwSessionRuntimeError(_ note: Notification) {
-        let err = note.userInfo?[AVCaptureSessionErrorKey] as? Error
-        let msg = "❌ UW runtime error: \(err?.localizedDescription ?? "unknown")"
-        print("[UW] \(msg)")
-        showUWDebug(msg)
-    }
-
-    @objc private func uwSessionInterrupted(_ note: Notification) {
-        let reasonRaw = (note.userInfo?[AVCaptureSessionInterruptionReasonKey] as? NSNumber)?.intValue ?? -1
-        // Reason 1 = VideoDeviceNotAvailableInBackground
-        // Reason 3 = VideoDeviceNotAvailableWithMultipleForegroundApps  ← ARKit resource conflict
-        // Reason 4 = VideoDeviceNotAvailableDueToSystemPressure
-        let msg = "⚠️ UW interrupted reason=\(reasonRaw)"
-        print("[UW] \(msg)")
-        showUWDebug(msg)
-
-        if reasonRaw == 3 || reasonRaw == 4 {
-            // Camera resource conflict with ARKit (reason=3) or system pressure (reason=4).
-            // The chosen preset is too demanding to coexist with ARKit.
-            // Stop the failed session and retry immediately at .high (640×480) which is
-            // known to work alongside ARKit on all tested devices.
-            let retryMsg = "⚠️ UW conflict — retrying at .high(640×480)…"
-            print("[UW] \(retryMsg)")
-            showUWDebug(retryMsg)
-            stopUWCaptureSession()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
-                self?.startUWCaptureSession(forcedPreset: .high)
-            }
-        }
-    }
-
-    @objc private func uwSessionResumed(_ note: Notification) {
-        let msg = "▶️ UW interruption ended — resumed"
-        print("[UW] \(msg)")
-        showUWDebug(msg)
-    }
-
-    private func stopUWCaptureSession() {
-        // Detach delegate first so no more callbacks fire after we nil the session.
-        uwVideoOutput?.setSampleBufferDelegate(nil, queue: nil)
-        let sessionToStop = uwSession
-        // Remove NotificationCenter observers before niling the session reference
-        // so the object: pointer remains valid during removeObserver.
-        if let s = sessionToStop {
-            NotificationCenter.default.removeObserver(self, name: .AVCaptureSessionRuntimeError, object: s)
-            NotificationCenter.default.removeObserver(self, name: .AVCaptureSessionWasInterrupted, object: s)
-            NotificationCenter.default.removeObserver(self, name: .AVCaptureSessionInterruptionEnded, object: s)
-        }
-        uwSession     = nil
-        uwVideoOutput = nil
-        DispatchQueue.global(qos: .background).async {
-            sessionToStop?.stopRunning()
-        }
-        uwFrameLock.lock()
-        uwRecentFrames.removeAll(keepingCapacity: false)
-        uwLatestPixelBuf = nil
-        uwLatestFW       = 0
-        uwLatestFH       = 0
-        lastUWFrameSize  = nil
-        uwFrameLock.unlock()
     }
 
     // MARK: - Actions
@@ -585,12 +317,6 @@ class ARScanViewController: UIViewController {
         doneButton.isEnabled = false
         isFinishingScan = true
         sceneView.session.pause()
-        // Stop the UW session immediately — frees camera hardware, pixel buffer pool,
-        // and Metal resources BEFORE PhotoProjector.project() begins allocating memory.
-        // Leaving it running caused Metal pipeline exhaustion (createCGImage → nil →
-        // blank canvas) and OOM crashes during projection on tight-memory devices.
-        // viewWillDisappear also calls stopUWCaptureSession() as a safety net.
-        stopUWCaptureSession()
         flushBatchToScene()
         // Release preview nodes before dismiss to avoid retaining large SceneKit buffers.
         let children = pointCloudNode.childNodes
@@ -966,29 +692,6 @@ extension ARScanViewController: ARSessionDelegate {
         if !hasReceivedFirstFrame {
             hasReceivedFirstFrame = true
             stabilizeUntil = now.addingTimeInterval(STABILIZE_SECS)
-            // Deferred UW start — wait until scan is fully in steady state.
-            //
-            // Timing breakdown from first ARKit frame:
-            //   STABILIZE_SECS          ≈ 4.0 s  (progress bar + overlay animation)
-            //   WARMUP_FRAMES / 60      ≈ 0.5 s  (depth-pipeline JIT warm-up)
-            //   extra settling buffer   = 3.5 s  (let ARKit + SceneKit reach steady CPU load)
-            //   ─────────────────────────────────
-            //   Total before UW starts  ≈ 8.0 s
-            //
-            // Why the extra 3.5 s matters: the old +0.5 fired at the exact moment
-            // warmup ended and real scanning ignited (ARKit writing depth + SceneKit
-            // uploading geometry + UW 1080p all competing for ISP/CPU simultaneously).
-            // That caused resource-constraint [33] → ARKit session failure → VC dismiss
-            // (looks like a crash to the user just 1 s into collecting dots).
-            // Starting UW 3.5 s into established scanning lets the A-series chip
-            // reach thermal/CPU steady state before we add the 1080p ISP load.
-            if !hasStartedUWSession {
-                hasStartedUWSession = true
-                let delay = STABILIZE_SECS + Double(WARMUP_FRAMES) / 60.0 + 3.5
-                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                    self?.startUWCaptureSession()
-                }
-            }
         }
 
         if now < stabilizeUntil {
@@ -1078,40 +781,19 @@ extension ARScanViewController: ARSessionDelegate {
         dismiss(animated: true) { [weak self] in self?.onComplete?([]) }
     }
 
-    /// Called when the ARSession is interrupted — typically because starting our
-    /// UW AVCaptureSession disrupts the camera daemon's XPC connections (-17281),
-    /// causing ARKit to lose its camera pipeline.
-    ///
-    /// CRITICAL: `sessionInterruptionEnded` only fires when the *cause* of the
-    /// interruption is removed.  As long as the 1080p UW session keeps the ISP
-    /// resource claimed, ARKit's XPC connection stays broken and the interruption
-    /// never "ends".  We must stop UW here to release that resource so the camera
-    /// daemon can heal and fire `sessionInterruptionEnded`.
+    /// ARSession interrupted (e.g. incoming call, system overlay).
+    /// We do NOT dismiss — sessionInterruptionEnded will resume scanning.
     func sessionWasInterrupted(_ session: ARSession) {
-        print("[ARKit] session interrupted — stopping UW to release camera-daemon XPC")
-        // Stopping UW releases the ISP/XPC resource holding ARKit's pipeline hostage.
-        // Once that resource is freed, the camera daemon heals and fires
-        // sessionInterruptionEnded, at which point we resume ARKit and restart UW
-        // at a lower resolution that coexists safely.
-        stopUWCaptureSession()
+        print("[ARKit] session interrupted")
         DispatchQueue.main.async { [weak self] in
             self?.countLabel.text = "Paused…"
         }
     }
 
-    /// Called once the interruption cause has been resolved (UW session stopped above,
-    /// camera-daemon XPC recovered).  We resume ARKit without any tracking reset so
-    /// the existing world frame and accumulated point cloud are fully preserved.
-    ///
-    /// Then we retry UW at 720p — half the ISP load of 1080p, much less likely to
-    /// repeat the disruption.  If a second interruption occurs anyway, we give up on
-    /// UW and fall back to ARKit's own capturedImage for remaining snapshots.
+    /// Resume the session without resetting tracking so the accumulated
+    /// point cloud and world coordinate frame are preserved.
     func sessionInterruptionEnded(_ session: ARSession) {
-        print("[ARKit] session interruption ended — resuming depth capture")
-        uwInterruptionCount += 1
-
-        // Resume ARKit after a brief settle — no reset options so tracking state
-        // and every accumulated point remain in the correct world coordinate frame.
+        print("[ARKit] session interruption ended — resuming")
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
             guard let self else { return }
             let config = ARWorldTrackingConfiguration()
@@ -1121,25 +803,6 @@ extension ARScanViewController: ARSessionDelegate {
                 config.frameSemantics = [.sceneDepth]
             }
             session.run(config)
-            // countLabel updates naturally on the next ARKit frame.
-        }
-
-        // Retry UW at 720p (first interruption only).
-        // 720p halves the ISP bandwidth vs 1080p; the camera daemon is less likely
-        // to issue XPC interruptions when adding a second session at this load.
-        // If 720p still causes a second interruption, uwInterruptionCount will be 2
-        // and we will not retry — remaining snapshots fall back to capturedImage.
-        if uwInterruptionCount == 1 {
-            let msg = "⚠️ UW restarting at 720p in 4 s…"
-            print("[UW] \(msg)")
-            showUWDebug(msg)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { [weak self] in
-                self?.startUWCaptureSession(forcedPreset: .hd1280x720)
-            }
-        } else {
-            let msg = "ℹ️ UW disabled after \(uwInterruptionCount) interrupts — main cam"
-            print("[UW] \(msg)")
-            showUWDebug(msg)
         }
     }
 
@@ -1148,21 +811,9 @@ extension ARScanViewController: ARSessionDelegate {
     /// Capture one JPEG snapshot + camera matrices if the camera has moved
     /// at least SNAPSHOT_MIN_MOVE metres since the last snapshot.
     ///
-    /// Image source priority:
-    ///   1. Ultra-wide CVPixelBuffer from the parallel AVCaptureSession (if running).
-    ///      Wider FOV → more wall surface covered per snapshot.  Per-frame intrinsics
-    ///      come from kCMSampleBufferAttachmentKey_CameraIntrinsicMatrix.
-    ///   2. ARKit frame.capturedImage (main camera) — fallback when UW session is
-    ///      unavailable or not yet producing frames.
-    ///
-    /// c2w is ALWAYS frame.camera.transform regardless of image source. For ultra-wide,
-    /// we pair the AR pose to the nearest UW frame by timestamp to avoid asynchronous
-    /// frame/pose mismatch artifacts (large-scale duplicated projection).
-    ///
-    /// fw/fh sent to the server are the *intrinsics reference-frame* dimensions
-    /// (original full-res), not the JPEG dimensions.  The web formula K[0]/fw and
-    /// K[4]/fh then correctly normalises to [0,1] UV regardless of JPEG scale.
-    ///
+    /// Uses ARKit's frame.capturedImage (main wide-angle camera).
+    /// fw/fh are the full sensor dimensions so the web formula K[0]/fw
+    /// correctly normalises to [0,1] UV regardless of JPEG scale.
     /// JPEG encode runs on a background thread to avoid stalling the AR loop.
     private func maybeCapture(frame: ARFrame, currentPos: SIMD3<Float>) {
         guard !isFinishingScan else { return }
@@ -1176,43 +827,12 @@ extension ARScanViewController: ARSessionDelegate {
         snapshotFrameCounter = 0
         lastSnapshotPos = currentPos
 
-        // ── Choose image source under the lock ──────────────────────────────
-        // For UW, pick the frame whose timestamp is nearest the current AR frame.
-        // This avoids pairing a stale/future UW image with the current AR pose,
-        // which causes room-wide duplicated projection when the device is moving.
-        uwFrameLock.lock()
-        let targetTs = frame.timestamp
-        let bestUW = uwRecentFrames.min(by: {
-            abs($0.ts - targetTs) < abs($1.ts - targetTs)
-        })
-        let uwInSync = bestUW != nil && abs((bestUW?.ts ?? 0) - targetTs) <= UW_MAX_SYNC_DRIFT_SEC
-        let uwPixBuf = uwInSync ? bestUW?.pixelBuf : nil
-        let uwK      = uwInSync ? (bestUW?.K ?? matrix_identity_float3x3) : matrix_identity_float3x3
-        let uwFW     = uwInSync ? (bestUW?.fw ?? 0) : 0
-        let uwFH     = uwInSync ? (bestUW?.fh ?? 0) : 0
-        uwFrameLock.unlock()
-
-        let useUW = uwPixBuf != nil && uwFW > 0 && uwFH > 0
-
-        let pixBuf:  CVPixelBuffer
-        let fullW:   Int
-        let fullH:   Int
-        let kMatrix: simd_float3x3
-
-        if useUW, let buf = uwPixBuf {
-            pixBuf  = buf
-            fullW   = uwFW
-            fullH   = uwFH
-            kMatrix = uwK
-        } else {
-            pixBuf  = frame.capturedImage
-            let res = frame.camera.imageResolution
-            fullW   = Int(res.width)
-            fullH   = Int(res.height)
-            kMatrix = frame.camera.intrinsics
-        }
-
-        let transform = frame.camera.transform   // always ARKit pose
+        let pixBuf   = frame.capturedImage
+        let res      = frame.camera.imageResolution
+        let fullW    = Int(res.width)
+        let fullH    = Int(res.height)
+        let kMatrix  = frame.camera.intrinsics
+        let transform = frame.camera.transform
         pendingSnapshotEncodes += 1
 
         DispatchQueue.global(qos: .utility).async { [weak self] in
@@ -1281,81 +901,3 @@ extension ARScanViewController: ARSessionDelegate {
     }
 }
 
-// MARK: - AVCaptureVideoDataOutputSampleBufferDelegate
-
-extension ARScanViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
-
-    /// Called on uwQueue for every ultra-wide video frame.
-    /// Extracts the CVPixelBuffer and per-frame intrinsic matrix, then stores them
-    /// under uwFrameLock for maybeCapture to consume on the ARKit delegate thread.
-    func captureOutput(_ output: AVCaptureOutput,
-                       didOutput sampleBuffer: CMSampleBuffer,
-                       from connection: AVCaptureConnection) {
-        guard let pixelBuf = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        let w = CVPixelBufferGetWidth(pixelBuf)
-        let h = CVPixelBufferGetHeight(pixelBuf)
-        let t = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
-        let ts = t.isFinite ? t : 0
-
-        // Read the per-frame intrinsic matrix from the CMSampleBuffer attachment.
-        //
-        // Apple stores kCMSampleBufferAttachmentKey_CameraIntrinsicMatrix as a
-        // simd_float3x3 in memory.  simd_float3x3 on ARM/x86 is 3 × SIMD3<Float>,
-        // and SIMD3<Float> occupies 16 bytes (4 floats) due to SIMD alignment —
-        // the 4th float is unused padding.  Total: 3 × 16 = 48 bytes.
-        //
-        // Layout: [fx, 0, 0, PAD,  0, fy, 0, PAD,  cx, cy, 1, PAD]
-        //          idx 0-3          idx 4-7          idx 8-11
-        //
-        // A previous version checked `>= 36` and read indices 0-8 packed, which
-        // treats the padding float (f[3]=0) as col1.x, shifts fy to col1.z (K[5]),
-        // and places cx at col2.z (K[8]).  The JS then reads K[4]=0 instead of fy
-        // and K[6]=0 instead of cx → every point fails UV bounds → 0 cameras used.
-        var K: simd_float3x3
-        if let attachData = CMGetAttachment(
-                sampleBuffer,
-                key: kCMSampleBufferAttachmentKey_CameraIntrinsicMatrix,
-                attachmentModeOut: nil) as? Data,
-           attachData.count >= 48 {
-            // Skip the 4th (padding) float of each SIMD3<Float> column.
-            K = attachData.withUnsafeBytes { ptr -> simd_float3x3 in
-                let f = ptr.bindMemory(to: Float.self)
-                return simd_float3x3(columns: (
-                    SIMD3<Float>(f[0], f[1],  f[2]),   // col0 = (fx,  0,  0), skip f[3]=pad
-                    SIMD3<Float>(f[4], f[5],  f[6]),   // col1 = ( 0, fy,  0), skip f[7]=pad
-                    SIMD3<Float>(f[8], f[9], f[10])    // col2 = (cx, cy,  1), skip f[11]=pad
-                ))
-            }
-        } else {
-            // Fallback: approximate typical UW focal length (≈0.65× short side)
-            // and principal point at image centre.  Not used in normal operation.
-            let fw = Float(w); let fh = Float(h)
-            let fEst = min(fw, fh) * 0.65
-            K = simd_float3x3(columns: (
-                SIMD3<Float>(fEst,    0,      0),
-                SIMD3<Float>(0,       fEst,   0),
-                SIMD3<Float>(fw * 0.5, fh * 0.5, 1)
-            ))
-        }
-
-        uwFrameLock.lock()
-        // Keep the latest frame fields for compatibility/debug and also keep
-        // a short timestamped history for AR↔UW frame matching.
-        uwLatestPixelBuf = pixelBuf
-        uwLatestK        = K
-        uwLatestFW       = w
-        uwLatestFH       = h
-        uwRecentFrames.append(UWFrameSample(pixelBuf: pixelBuf, K: K, fw: w, fh: h, ts: ts))
-        if uwRecentFrames.count > UW_MAX_BUFFERED_FRAMES {
-            uwRecentFrames.removeFirst(uwRecentFrames.count - UW_MAX_BUFFERED_FRAMES)
-        }
-        if lastUWFrameSize == nil || lastUWFrameSize!.0 != w || lastUWFrameSize!.1 != h {
-            lastUWFrameSize = (w, h)
-            let fxVal = Int(K.columns.0.x)
-            let msg = "✅ UW frame: \(w)×\(h) fx=\(fxVal)"
-            print("[UW] \(msg)")
-            DispatchQueue.main.async { [weak self] in self?.showUWDebug(msg) }
-        }
-        uwFrameLock.unlock()
-    }
-}
