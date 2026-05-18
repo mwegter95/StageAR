@@ -101,6 +101,7 @@ class ARScanViewController: UIViewController {
     /// Guards the one-time deferred UW session start (fires on first ARKit frame so
     /// ARKit has fully claimed its ISP resources before we add the UW camera).
     private var hasStartedUWSession = false
+    private var uwInterruptionCount = 0   // how many times ARKit was interrupted by UW startup
     private var uwLatestPixelBuf: CVPixelBuffer?
     private var uwLatestK:        simd_float3x3 = matrix_identity_float3x3
     private var uwLatestFW:       Int = 0
@@ -341,6 +342,7 @@ class ARScanViewController: UIViewController {
         hasReceivedFirstFrame = false
         warmupFramesRemaining = 0
         hasStartedUWSession = false  // reset so deferred start fires on first ARKit frame
+        uwInterruptionCount = 0      // reset retry budget for a fresh scan
         sceneView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
         // UW session is started on the first ARKit frame (see ARSessionDelegate) so ARKit
         // has fully claimed its ISP resources before we compete for the UW sensor.
@@ -1076,27 +1078,40 @@ extension ARScanViewController: ARSessionDelegate {
         dismiss(animated: true) { [weak self] in self?.onComplete?([]) }
     }
 
-    /// Called when the ARSession is temporarily interrupted — typically because the
-    /// UW AVCaptureSession startup causes a brief XPC disruption to the camera daemon,
-    /// which ARKit surfaces as an interruption rather than a fatal failure.
+    /// Called when the ARSession is interrupted — typically because starting our
+    /// UW AVCaptureSession disrupts the camera daemon's XPC connections (-17281),
+    /// causing ARKit to lose its camera pipeline.
     ///
-    /// Frame delivery (`session(_:didUpdate:)`) stops silently during the interruption.
-    /// We must NOT dismiss here — `sessionInterruptionEnded` will resume scanning.
+    /// CRITICAL: `sessionInterruptionEnded` only fires when the *cause* of the
+    /// interruption is removed.  As long as the 1080p UW session keeps the ISP
+    /// resource claimed, ARKit's XPC connection stays broken and the interruption
+    /// never "ends".  We must stop UW here to release that resource so the camera
+    /// daemon can heal and fire `sessionInterruptionEnded`.
     func sessionWasInterrupted(_ session: ARSession) {
-        print("[ARKit] session interrupted — UW startup XPC disruption; waiting for resume")
+        print("[ARKit] session interrupted — stopping UW to release camera-daemon XPC")
+        // Stopping UW releases the ISP/XPC resource holding ARKit's pipeline hostage.
+        // Once that resource is freed, the camera daemon heals and fires
+        // sessionInterruptionEnded, at which point we resume ARKit and restart UW
+        // at a lower resolution that coexists safely.
+        stopUWCaptureSession()
         DispatchQueue.main.async { [weak self] in
             self?.countLabel.text = "Paused…"
         }
     }
 
-    /// Called when the temporary ARSession interruption has ended.
-    /// We re-run the same configuration WITHOUT any reset options so the existing
-    /// world coordinate frame and the entire accumulated point cloud are preserved.
+    /// Called once the interruption cause has been resolved (UW session stopped above,
+    /// camera-daemon XPC recovered).  We resume ARKit without any tracking reset so
+    /// the existing world frame and accumulated point cloud are fully preserved.
     ///
-    /// The brief delay before re-run lets any residual camera-daemon XPC state settle
-    /// so ARKit doesn't immediately get interrupted again.
+    /// Then we retry UW at 720p — half the ISP load of 1080p, much less likely to
+    /// repeat the disruption.  If a second interruption occurs anyway, we give up on
+    /// UW and fall back to ARKit's own capturedImage for remaining snapshots.
     func sessionInterruptionEnded(_ session: ARSession) {
         print("[ARKit] session interruption ended — resuming depth capture")
+        uwInterruptionCount += 1
+
+        // Resume ARKit after a brief settle — no reset options so tracking state
+        // and every accumulated point remain in the correct world coordinate frame.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
             guard let self else { return }
             let config = ARWorldTrackingConfiguration()
@@ -1105,10 +1120,26 @@ extension ARScanViewController: ARSessionDelegate {
             } else {
                 config.frameSemantics = [.sceneDepth]
             }
-            // No .resetTracking / .removeExistingAnchors — tracking state and anchors
-            // must survive so all accumulated points remain in the correct world frame.
             session.run(config)
-            // countLabel will update naturally on the next processed ARKit frame.
+            // countLabel updates naturally on the next ARKit frame.
+        }
+
+        // Retry UW at 720p (first interruption only).
+        // 720p halves the ISP bandwidth vs 1080p; the camera daemon is less likely
+        // to issue XPC interruptions when adding a second session at this load.
+        // If 720p still causes a second interruption, uwInterruptionCount will be 2
+        // and we will not retry — remaining snapshots fall back to capturedImage.
+        if uwInterruptionCount == 1 {
+            let msg = "⚠️ UW restarting at 720p in 4 s…"
+            print("[UW] \(msg)")
+            showUWDebug(msg)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { [weak self] in
+                self?.startUWCaptureSession(forcedPreset: .hd1280x720)
+            }
+        } else {
+            let msg = "ℹ️ UW disabled after \(uwInterruptionCount) interrupts — main cam"
+            print("[UW] \(msg)")
+            showUWDebug(msg)
         }
     }
 
