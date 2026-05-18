@@ -1076,6 +1076,42 @@ extension ARScanViewController: ARSessionDelegate {
         dismiss(animated: true) { [weak self] in self?.onComplete?([]) }
     }
 
+    /// Called when the ARSession is temporarily interrupted — typically because the
+    /// UW AVCaptureSession startup causes a brief XPC disruption to the camera daemon,
+    /// which ARKit surfaces as an interruption rather than a fatal failure.
+    ///
+    /// Frame delivery (`session(_:didUpdate:)`) stops silently during the interruption.
+    /// We must NOT dismiss here — `sessionInterruptionEnded` will resume scanning.
+    func sessionWasInterrupted(_ session: ARSession) {
+        print("[ARKit] session interrupted — UW startup XPC disruption; waiting for resume")
+        DispatchQueue.main.async { [weak self] in
+            self?.countLabel.text = "Paused…"
+        }
+    }
+
+    /// Called when the temporary ARSession interruption has ended.
+    /// We re-run the same configuration WITHOUT any reset options so the existing
+    /// world coordinate frame and the entire accumulated point cloud are preserved.
+    ///
+    /// The brief delay before re-run lets any residual camera-daemon XPC state settle
+    /// so ARKit doesn't immediately get interrupted again.
+    func sessionInterruptionEnded(_ session: ARSession) {
+        print("[ARKit] session interruption ended — resuming depth capture")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            guard let self else { return }
+            let config = ARWorldTrackingConfiguration()
+            if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
+                config.frameSemantics = [.sceneDepth, .smoothedSceneDepth]
+            } else {
+                config.frameSemantics = [.sceneDepth]
+            }
+            // No .resetTracking / .removeExistingAnchors — tracking state and anchors
+            // must survive so all accumulated points remain in the correct world frame.
+            session.run(config)
+            // countLabel will update naturally on the next processed ARKit frame.
+        }
+    }
+
     // MARK: - Snapshot capture
 
     /// Capture one JPEG snapshot + camera matrices if the camera has moved
