@@ -772,11 +772,9 @@ extension ARScanViewController: ARSessionDelegate {
     func session(_ session: ARSession, didFailWithError error: Error) {
         let msg = error.localizedDescription
         print("[ARKit] session didFailWithError: \(msg)")
-        // Surface the error in the HUD so it's visible during debugging.
-        showUWDebug("ARKit fail: \(msg)")
-        // Stop UW immediately to release ISP resources.
-        stopUWCaptureSession()
-        // Notify JS so the web app can show an error state instead of hanging.
+        DispatchQueue.main.async { [weak self] in
+            self?.countLabel.text = "Error"
+        }
         ARBridge.shared.sendError("ARKit session failed: \(msg)")
         dismiss(animated: true) { [weak self] in self?.onComplete?([]) }
     }
@@ -794,8 +792,7 @@ extension ARScanViewController: ARSessionDelegate {
     /// point cloud and world coordinate frame are preserved.
     func sessionInterruptionEnded(_ session: ARSession) {
         print("[ARKit] session interruption ended — resuming")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-            guard let self else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
             let config = ARWorldTrackingConfiguration()
             if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
                 config.frameSemantics = [.sceneDepth, .smoothedSceneDepth]
