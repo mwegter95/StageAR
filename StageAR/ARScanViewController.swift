@@ -338,6 +338,12 @@ class ARScanViewController: UIViewController {
         let snapshots = capturedSnapshots
         let total     = accumulatedCloud.count / 6
 
+        // Free the originals immediately — the locals above now own the data.
+        // This reclaims the 240 MB on the main thread before we copy again inside
+        // the background task, keeping peak memory at ~one copy instead of three.
+        accumulatedCloud.removeAll(keepingCapacity: false)
+        capturedSnapshots.removeAll()
+
         ARBridge.shared.sendProjecting()
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -354,23 +360,39 @@ class ARScanViewController: UIViewController {
 
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                // Start iOS → backend upload immediately (concurrent with chunk streaming).
-                // This bypasses the browser XHR so save is near-instant from JS perspective:
-                // JS just waits for the 'uploadComplete' message instead of running its own XHR.
+
+                // Fire direct iOS→backend upload (URLSession background task).
                 ARBridge.shared.uploadPointCloudDirect(floats: coloredCloud)
 
-                // Stream the colored cloud to JS in 100 000-point chunks for in-memory display.
-                let chunkFloats = 100_000 * 6
-                var offset = 0
-                while offset < coloredCloud.count {
-                    let end   = min(offset + chunkFloats, coloredCloud.count)
-                    ARBridge.shared.sendChunk(Array(coloredCloud[offset..<end]))
-                    offset = end
-                }
+                // Dismiss immediately so the web UI (name input, save button) is
+                // interactive right away.  Chunk streaming continues on the main
+                // thread after dismiss — the local function below holds coloredCloud
+                // alive via closure capture until the last chunk is sent.
                 self.dismiss(animated: true) {
                     self.onComplete?([])
-                    ARBridge.shared.sendDone(pointCount: total)
                 }
+
+                // Stream one chunk per run-loop iteration.
+                //
+                // The old while-loop approach called sendChunk 100× in a tight loop.
+                // Each sendChunk called ARBridge.send which dispatched async to main,
+                // so all 100 closures queued up before any executed — each holding a
+                // ~3.2 MB base64 string = ~320 MB piled in the queue.  Combined with
+                // the two 240 MB cloud copies this pushed peak to ~800 MB → OOM crash.
+                //
+                // Here we send one chunk, yield to the run loop (so WKWebView's XPC
+                // layer can digest it), then send the next.  Peak overhead: ~3 MB.
+                let chunkFloats = 100_000 * 6
+                func sendNext(offset: Int) {
+                    guard offset < coloredCloud.count else {
+                        ARBridge.shared.sendDone(pointCount: total)
+                        return
+                    }
+                    let end = min(offset + chunkFloats, coloredCloud.count)
+                    ARBridge.shared.sendChunk(Array(coloredCloud[offset..<end]))
+                    DispatchQueue.main.async { sendNext(offset: end) }
+                }
+                sendNext(offset: 0)
             }
         }
     }

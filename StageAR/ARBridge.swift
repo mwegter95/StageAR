@@ -40,10 +40,21 @@ final class ARBridge: NSObject {
 
     // MARK: - Send helpers
 
-    private func send(_ js: String) {
-        DispatchQueue.main.async { [weak self] in
-            self?.webView?.evaluateJavaScript(
+    func send(_ js: String) {
+        // If already on the main thread, call evaluateJavaScript directly so the
+        // JS string is handed to WKWebView's XPC layer immediately and can be freed
+        // before the next call.  Dispatching async when already on main causes all
+        // N closures to queue up — each holding its base64 string — before any of
+        // them execute, producing an O(N × chunkSize) memory spike (≈320 MB for a
+        // 10 M-point cloud streamed in 100 chunks).
+        if Thread.isMainThread {
+            webView?.evaluateJavaScript(
                 "window.onStageARResult && window.onStageARResult(\(js))", completionHandler: nil)
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.webView?.evaluateJavaScript(
+                    "window.onStageARResult && window.onStageARResult(\(js))", completionHandler: nil)
+            }
         }
     }
 
