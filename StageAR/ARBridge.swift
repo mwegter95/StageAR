@@ -47,7 +47,7 @@ final class ARBridge: NSObject {
         }
     }
 
-    private func sendError(_ msg: String) {
+    func sendError(_ msg: String) {
         let safe = msg
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "'",  with: "\\'")
