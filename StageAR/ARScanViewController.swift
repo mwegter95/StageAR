@@ -964,20 +964,25 @@ extension ARScanViewController: ARSessionDelegate {
         if !hasReceivedFirstFrame {
             hasReceivedFirstFrame = true
             stabilizeUntil = now.addingTimeInterval(STABILIZE_SECS)
-            // Deferred UW start — wait until AFTER the stabilization window ends.
+            // Deferred UW start — wait until scan is fully in steady state.
             //
-            // Why: starting hd1920x1080 on the very first ARKit frame competes for
-            // the ISP before ARKit's pipeline is fully established.  Even though
-            // ARKit claimed the sensor first, the UW 1080p session can reduce ARKit
-            // frame delivery to near-zero, which freezes the stabilization progress
-            // bar (it lives inside the ARKit frame callback) so scanning never starts.
+            // Timing breakdown from first ARKit frame:
+            //   STABILIZE_SECS          ≈ 4.0 s  (progress bar + overlay animation)
+            //   WARMUP_FRAMES / 60      ≈ 0.5 s  (depth-pipeline JIT warm-up)
+            //   extra settling buffer   = 3.5 s  (let ARKit + SceneKit reach steady CPU load)
+            //   ─────────────────────────────────
+            //   Total before UW starts  ≈ 8.0 s
             //
-            // Solution: let stabilization complete uncontested (STABILIZE_SECS), then
-            // bring the UW session up once ARKit is actively delivering depth frames.
-            // 0.5 s extra buffer covers the overlay-dismiss animation + warmup flush.
+            // Why the extra 3.5 s matters: the old +0.5 fired at the exact moment
+            // warmup ended and real scanning ignited (ARKit writing depth + SceneKit
+            // uploading geometry + UW 1080p all competing for ISP/CPU simultaneously).
+            // That caused resource-constraint [33] → ARKit session failure → VC dismiss
+            // (looks like a crash to the user just 1 s into collecting dots).
+            // Starting UW 3.5 s into established scanning lets the A-series chip
+            // reach thermal/CPU steady state before we add the 1080p ISP load.
             if !hasStartedUWSession {
                 hasStartedUWSession = true
-                let delay = STABILIZE_SECS + 0.5
+                let delay = STABILIZE_SECS + Double(WARMUP_FRAMES) / 60.0 + 3.5
                 DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
                     self?.startUWCaptureSession()
                 }
@@ -1060,6 +1065,14 @@ extension ARScanViewController: ARSessionDelegate {
     }
 
     func session(_ session: ARSession, didFailWithError error: Error) {
+        let msg = error.localizedDescription
+        print("[ARKit] session didFailWithError: \(msg)")
+        // Surface the error in the HUD so it's visible during debugging.
+        showUWDebug("ARKit fail: \(msg)")
+        // Stop UW immediately to release ISP resources.
+        stopUWCaptureSession()
+        // Notify JS so the web app can show an error state instead of hanging.
+        ARBridge.shared.sendError("ARKit session failed: \(msg)")
         dismiss(animated: true) { [weak self] in self?.onComplete?([]) }
     }
 
